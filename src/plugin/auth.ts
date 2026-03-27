@@ -110,23 +110,71 @@ function getLanguageServerProcess(): string | null {
 }
 
 /**
- * Extract CSRF token from running Windsurf language server process
+ * Extract the PID of the language server from ps output
+ */
+function getLanguageServerPid(processInfo: string): string | null {
+  const pidMatch = processInfo.match(/^\s*\S+\s+(\d+)/);
+  return pidMatch ? pidMatch[1] : null;
+}
+
+/**
+ * Extract CSRF token from the language server process environment variables.
+ * Newer Windsurf versions (1.108+) pass the CSRF token via --stdin_initial_metadata
+ * and set WINDSURF_CSRF_TOKEN in the child process environment instead of using
+ * the --csrf_token CLI argument.
+ */
+function getCSRFTokenFromEnv(processInfo: string): string | null {
+  if (process.platform === 'win32') {
+    return null;
+  }
+
+  const pid = getLanguageServerPid(processInfo);
+  if (!pid) {
+    return null;
+  }
+
+  try {
+    const envOutput = execSync(
+      `ps eww -p ${pid} 2>/dev/null`,
+      { encoding: 'utf8', timeout: 5000 }
+    );
+    const envMatch = envOutput.match(/WINDSURF_CSRF_TOKEN=([a-f0-9-]+)/);
+    return envMatch?.[1] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Extract CSRF token from running Windsurf language server process.
+ *
+ * Tries two sources in order:
+ * 1. --csrf_token CLI argument (older Windsurf versions)
+ * 2. WINDSURF_CSRF_TOKEN environment variable of the language server process
+ *    (newer Windsurf versions that use --stdin_initial_metadata)
  */
 export function getCSRFToken(): string {
   const processInfo = getLanguageServerProcess();
-  
+
   if (!processInfo) {
     throw new WindsurfError(
       'Windsurf language server not found. Is Windsurf running?',
       WindsurfErrorCode.NOT_RUNNING
     );
   }
-  
+
+  // Method 1: CLI argument (older Windsurf versions)
   const match = processInfo.match(/--csrf_token\s+([a-f0-9-]+)/);
   if (match?.[1]) {
     return match[1];
   }
-  
+
+  // Method 2: Environment variable (newer Windsurf versions)
+  const envToken = getCSRFTokenFromEnv(processInfo);
+  if (envToken) {
+    return envToken;
+  }
+
   throw new WindsurfError(
     'CSRF token not found in Windsurf process. Is Windsurf running?',
     WindsurfErrorCode.CSRF_MISSING
