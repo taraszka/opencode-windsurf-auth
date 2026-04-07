@@ -203,55 +203,33 @@ function decodeVarintFromBuf(buffer: Buffer, offset: number): [bigint, number] {
 }
 
 /**
- * Extract all readable text strings from a protobuf buffer (recursive).
- * The cascade response has deeply nested structures; we extract any
- * string field that looks like content.
+ * Parse protobuf fields from a buffer.
+ * Returns array of {fieldNum, wireType, data/value}.
  */
-function extractTextsFromProtobuf(buffer: Buffer): string[] {
-  const texts: string[] = [];
+function parseProtoFields(buffer: Buffer): Array<{
+  fieldNum: number;
+  wireType: number;
+  data?: Buffer;
+  value?: bigint;
+}> {
+  const fields: Array<{ fieldNum: number; wireType: number; data?: Buffer; value?: bigint }> = [];
   let offset = 0;
-
   while (offset < buffer.length) {
     const [tag, tagBytes] = decodeVarintFromBuf(buffer, offset);
+    const fieldNum = Number(tag >> 3n);
     const wireType = Number(tag & 0x7n);
     offset += tagBytes;
-
     if (wireType === 0) {
-      // varint - skip
-      const [, valBytes] = decodeVarintFromBuf(buffer, offset);
+      const [val, valBytes] = decodeVarintFromBuf(buffer, offset);
       offset += valBytes;
+      fields.push({ fieldNum, wireType, value: val });
     } else if (wireType === 2) {
-      // length-delimited
       const [len, lenBytes] = decodeVarintFromBuf(buffer, offset);
       offset += lenBytes;
-      const dataLen = Number(len);
-      if (offset + dataLen > buffer.length) break;
-      const data = buffer.subarray(offset, offset + dataLen);
-
-      // Try to interpret as string
-      const str = data.toString('utf8');
-      const isText = dataLen > 0 && /^[\x20-\x7e\n\r\t\u00a0-\uffff]+$/.test(str);
-
-      if (isText && dataLen > 1) {
-        // Filter out UUIDs, enum names, and paths
-        if (
-          !/^[a-f0-9-]{36}$/.test(str) &&
-          !/^MODEL_/.test(str) &&
-          !/^\/Applications\//.test(str) &&
-          !/^exa\./.test(str) &&
-          !/^windsurf$/.test(str) &&
-          !/^[0-9.]+$/.test(str) &&
-          !/^[a-z]{2}$/.test(str) // locale
-        ) {
-          texts.push(str);
-        }
-      } else if (dataLen > 2) {
-        // Try as nested message
-        const nested = extractTextsFromProtobuf(data);
-        texts.push(...nested);
-      }
-
-      offset += dataLen;
+      const l = Number(len);
+      if (offset + l > buffer.length) break;
+      fields.push({ fieldNum, wireType, data: buffer.subarray(offset, offset + l) });
+      offset += l;
     } else if (wireType === 5) {
       offset += 4;
     } else if (wireType === 1) {
@@ -260,7 +238,50 @@ function extractTextsFromProtobuf(buffer: Buffer): string[] {
       break;
     }
   }
+  return fields;
+}
 
+/**
+ * Recursively find all field-15 string values in a protobuf buffer.
+ *
+ * In the Cascade reactive update stream, field 15 at the deepest message
+ * nesting contains the assistant's response text chunks. We collect all
+ * f15 strings that aren't metadata (model names, UUIDs, paths, etc).
+ */
+function extractContentFromReactiveUpdate(buffer: Buffer): string[] {
+  const texts: string[] = [];
+
+  function walk(buf: Buffer): void {
+    const fields = parseProtoFields(buf);
+    for (const f of fields) {
+      if (f.wireType !== 2 || !f.data) continue;
+      const data = f.data;
+      const str = data.toString('utf8');
+      const isPrintable = data.length > 0 && /^[\x20-\x7e\n\r\t\u00a0-\uffff]+$/.test(str);
+
+      if (f.fieldNum === 15 && isPrintable) {
+        // Field 15 at any depth = potential content text
+        // Filter metadata noise
+        if (
+          !/^[a-f0-9-]{10,}$/.test(str) &&
+          !/^MODEL_/.test(str) &&
+          !/^claude-/.test(str) &&
+          !/^\//.test(str) &&
+          !/^windsurf$/i.test(str) &&
+          !/^[0-9.]+$/.test(str) &&
+          !/^(Response Statistics|Credits spent|credits?|model|Model| credits?|yaml)$/i.test(str) &&
+          !/^Claude (Opus|Sonnet|Haiku|Code)/.test(str)
+        ) {
+          texts.push(str);
+        }
+      } else if (!isPrintable && data.length > 2) {
+        // Recurse into nested messages
+        walk(data);
+      }
+    }
+  }
+
+  walk(buffer);
   return texts;
 }
 
@@ -299,8 +320,31 @@ export async function* streamCascadeChat(
   }
   const userMessage = parts.join('\n\n');
 
-  // Step 1: Open streaming connection for reactive updates
-  const streamBody = buildStreamReactiveUpdatesRequest(cascadeId);
+  // Step 1: StartCascade to get a server-registered cascade_id
+  const startBody = Buffer.from(encodeMessage(1, buildMetadata(apiKey, version)));
+  const startResult = await connectPost(
+    port,
+    '/exa.language_server_pb.LanguageServerService/StartCascade',
+    csrfToken,
+    startBody
+  );
+  if (startResult.status !== 200) {
+    throw new WindsurfError(
+      `StartCascade failed: ${startResult.data.toString('utf8')}`,
+      WindsurfErrorCode.CONNECTION_FAILED
+    );
+  }
+  const serverCascadeId = (() => {
+    const fields = parseProtoFields(startResult.data);
+    const f1 = fields.find(f => f.fieldNum === 1 && f.data);
+    return f1?.data?.toString('utf8') || cascadeId;
+  })();
+
+  // Step 2: Open streaming connection (envelope-framed Connect protocol)
+  const streamProto = buildStreamReactiveUpdatesRequest(serverCascadeId);
+  const streamEnvelope = Buffer.alloc(5 + streamProto.length);
+  streamEnvelope.writeUInt32BE(streamProto.length, 1);
+  streamProto.copy(streamEnvelope, 5);
 
   const streamPromise = new Promise<Buffer[]>((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -311,10 +355,9 @@ export async function* streamCascadeChat(
         path: '/exa.language_server_pb.LanguageServerService/StreamCascadeReactiveUpdates',
         method: 'POST',
         headers: {
-          'content-type': 'application/proto',
+          'content-type': 'application/connect+proto',
           'connect-protocol-version': '1',
           'x-codeium-csrf-token': csrfToken,
-          'accept-encoding': 'identity',
         },
       },
       (res) => {
@@ -324,46 +367,37 @@ export async function* streamCascadeChat(
       }
     );
     req.on('error', reject);
-    req.write(streamBody);
+    req.write(streamEnvelope);
     req.end();
-
-    // Timeout after 2 minutes
-    setTimeout(() => {
-      req.destroy();
-      resolve(chunks);
-    }, 120000);
+    setTimeout(() => { req.destroy(); resolve(chunks); }, 120000);
   });
 
-  // Small delay to ensure stream is established
-  await new Promise((r) => setTimeout(r, 100));
+  await new Promise((r) => setTimeout(r, 300));
 
-  // Step 2: Send the user message
+  // Step 3: Send the user message
   const sendBody = buildSendUserCascadeMessageRequest(
     apiKey,
     version,
-    cascadeId,
+    serverCascadeId,
     modelUid,
     userMessage
   );
-
   const sendResult = await connectPost(
     port,
     '/exa.language_server_pb.LanguageServerService/SendUserCascadeMessage',
     csrfToken,
     sendBody
   );
-
   if (sendResult.status !== 200) {
     throw new WindsurfError(
-      `SendUserCascadeMessage failed with status ${sendResult.status}`,
+      `SendUserCascadeMessage failed: ${sendResult.data.toString('utf8')}`,
       WindsurfErrorCode.STREAM_ERROR
     );
   }
 
-  // Step 3: Wait for streaming response and extract text
+  // Step 4: Wait for streaming response
   const responseChunks = await streamPromise;
   const fullResponse = Buffer.concat(responseChunks);
-
   if (fullResponse.length === 0) {
     throw new WindsurfError(
       'Empty response from Cascade stream',
@@ -372,8 +406,7 @@ export async function* streamCascadeChat(
   }
 
   // Parse Connect protocol streaming response
-  // Connect streaming uses chunked transfer with each chunk being:
-  // 1 byte flags (0 = data, 2 = end) + 4 bytes length + protobuf payload
+  // Each chunk is envelope-framed: 1 byte flags + 4 bytes length + protobuf
   let offset = 0;
   const allTexts: string[] = [];
 
@@ -384,24 +417,20 @@ export async function* streamCascadeChat(
 
     if (offset + msgLen > fullResponse.length) break;
 
-    if (flags === 2) {
-      // End-of-stream marker
-      break;
-    }
+    if (flags === 2) break; // End-of-stream
 
     const msgData = fullResponse.subarray(offset, offset + msgLen);
-    const texts = extractTextsFromProtobuf(msgData);
+    const texts = extractContentFromReactiveUpdate(msgData);
     allTexts.push(...texts);
     offset += msgLen;
   }
 
-  // If Connect framing didn't work, try raw protobuf extraction
+  // Fallback: try raw protobuf if Connect framing didn't match
   if (allTexts.length === 0) {
-    const texts = extractTextsFromProtobuf(fullResponse);
+    const texts = extractContentFromReactiveUpdate(fullResponse);
     allTexts.push(...texts);
   }
 
-  // Yield all extracted text
   if (allTexts.length > 0) {
     yield allTexts.join('');
   }
