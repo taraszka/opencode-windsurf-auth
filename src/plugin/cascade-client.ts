@@ -242,47 +242,85 @@ function parseProtoFields(buffer: Buffer): Array<{
 }
 
 /**
- * Recursively find all field-15 string values in a protobuf buffer.
+ * Extract assistant response text from a Cascade reactive update frame.
  *
- * In the Cascade reactive update stream, field 15 at the deepest message
- * nesting contains the assistant's response text chunks. We collect all
- * f15 strings that aren't metadata (model names, UUIDs, paths, etc).
+ * The assistant's text is in f15 strings inside frames that contain a "bot-" UUID.
+ * We only extract from frames with the bot marker to avoid system prompt leakage.
  */
 function extractContentFromReactiveUpdate(buffer: Buffer): string[] {
+  // Only extract from frames containing the bot marker (assistant messages)
+  const frameStr = buffer.toString('utf8');
+  if (!frameStr.includes('bot-')) return [];
+
   const texts: string[] = [];
 
-  function walk(buf: Buffer): void {
+  function collectF15(buf: Buffer): void {
     const fields = parseProtoFields(buf);
     for (const f of fields) {
       if (f.wireType !== 2 || !f.data) continue;
-      const data = f.data;
-      const str = data.toString('utf8');
-      const isPrintable = data.length > 0 && /^[\x20-\x7e\n\r\t\u00a0-\uffff]+$/.test(str);
+      const str = f.data.toString('utf8');
+      const isPrintable = f.data.length > 0 && /^[\x20-\x7e\n\r\t\u00a0-\uffff]+$/.test(str);
 
       if (f.fieldNum === 15 && isPrintable) {
-        // Field 15 at any depth = potential content text
-        // Filter metadata noise
+        // Filter out known metadata strings
         if (
           !/^[a-f0-9-]{10,}$/.test(str) &&
           !/^MODEL_/.test(str) &&
           !/^claude-/.test(str) &&
           !/^\//.test(str) &&
           !/^windsurf$/i.test(str) &&
-          !/^[0-9.]+$/.test(str) &&
-          !/^(Response Statistics|Credits spent|credits?|model|Model| credits?|yaml)$/i.test(str) &&
+          !/^bot-/.test(str) &&
+          !/^z[\$a-f0-9]/.test(str) &&
+          !/^[a-zA-Z0-9]{20,}$/.test(str) && // random ID strings
+          !/^(Response Statistics|Credits spent|credits?|model|Model| credits?|yaml|trafficType)$/i.test(str) &&
           !/^Claude (Opus|Sonnet|Haiku|Code)/.test(str)
         ) {
           texts.push(str);
         }
-      } else if (!isPrintable && data.length > 2) {
-        // Recurse into nested messages
-        walk(data);
+      } else if (!isPrintable && f.data.length > 2) {
+        collectF15(f.data);
       }
     }
   }
 
+  collectF15(buffer);
+
+  // Deduplicate (the cascade sends content twice - once in the message, once in a copy)
+  const seen = new Set<string>();
+  return texts.filter(t => {
+    if (seen.has(t)) return false;
+    seen.add(t);
+    return true;
+  });
+}
+
+/**
+ * Extract ALL f15 printable strings from a protobuf buffer (no bot-marker filter).
+ * Used for response frames after the bot marker has been seen.
+ */
+function extractAllF15Strings(buffer: Buffer): string[] {
+  const texts: string[] = [];
+  function walk(buf: Buffer): void {
+    const fields = parseProtoFields(buf);
+    for (const f of fields) {
+      if (f.wireType !== 2 || !f.data) continue;
+      const str = f.data.toString('utf8');
+      const isPrintable = f.data.length > 0 && /^[\x20-\x7e\n\r\t\u00a0-\uffff]+$/.test(str);
+      if (f.fieldNum === 15 && isPrintable && f.data.length > 1) {
+        texts.push(str);
+      } else if (!isPrintable && f.data.length > 2) {
+        walk(f.data);
+      }
+    }
+  }
   walk(buffer);
-  return texts;
+  // Deduplicate
+  const seen = new Set<string>();
+  return texts.filter(t => {
+    if (seen.has(t)) return false;
+    seen.add(t);
+    return true;
+  });
 }
 
 // ============================================================================
@@ -346,9 +384,30 @@ export async function* streamCascadeChat(
   streamEnvelope.writeUInt32BE(streamProto.length, 1);
   streamProto.copy(streamEnvelope, 5);
 
-  const streamPromise = new Promise<Buffer[]>((resolve, reject) => {
+  let markMessageSent: () => void = () => {};
+
+  const streamPromise = new Promise<Buffer[]>((resolve) => {
     const chunks: Buffer[] = [];
-    const req = http.request(
+    let settled = false;
+    let idleTimer: ReturnType<typeof setTimeout> | null = null;
+    let messageSent = false;
+
+    function settleStream() {
+      if (settled) return;
+      settled = true;
+      if (idleTimer) clearTimeout(idleTimer);
+      resolve(chunks);
+    }
+
+    function resetIdleTimer() {
+      if (!messageSent) return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(settleStream, 8000);
+    }
+
+    markMessageSent = () => { messageSent = true; resetIdleTimer(); };
+
+    const streamReq = http.request(
       {
         hostname: '127.0.0.1',
         port,
@@ -361,15 +420,18 @@ export async function* streamCascadeChat(
         },
       },
       (res) => {
-        res.on('data', (chunk: Buffer) => chunks.push(chunk));
-        res.on('end', () => resolve(chunks));
-        res.on('error', reject);
+        res.on('data', (chunk: Buffer) => {
+          chunks.push(chunk);
+          resetIdleTimer();
+        });
+        res.on('end', settleStream);
+        res.on('error', () => settleStream());
       }
     );
-    req.on('error', reject);
-    req.write(streamEnvelope);
-    req.end();
-    setTimeout(() => { req.destroy(); resolve(chunks); }, 120000);
+    streamReq.on('error', () => settleStream());
+    streamReq.write(streamEnvelope);
+    streamReq.end();
+    setTimeout(settleStream, 120000);
   });
 
   await new Promise((r) => setTimeout(r, 300));
@@ -395,6 +457,9 @@ export async function* streamCascadeChat(
     );
   }
 
+  // Signal that message was sent so idle timer starts
+  markMessageSent();
+
   // Step 4: Wait for streaming response
   const responseChunks = await streamPromise;
   const fullResponse = Buffer.concat(responseChunks);
@@ -407,32 +472,66 @@ export async function* streamCascadeChat(
 
   // Parse Connect protocol streaming response
   // Each chunk is envelope-framed: 1 byte flags + 4 bytes length + protobuf
+  // The stream contains: cascade config → user message echo → bot response → stats
+  // We only want the bot response text, which appears AFTER the user message.
   let offset = 0;
-  const allTexts: string[] = [];
+  const frames: Buffer[] = [];
 
   while (offset + 5 <= fullResponse.length) {
     const flags = fullResponse[offset];
     const msgLen = fullResponse.readUInt32BE(offset + 1);
     offset += 5;
-
     if (offset + msgLen > fullResponse.length) break;
-
-    if (flags === 2) break; // End-of-stream
-
-    const msgData = fullResponse.subarray(offset, offset + msgLen);
-    const texts = extractContentFromReactiveUpdate(msgData);
-    allTexts.push(...texts);
+    if (flags === 2) break;
+    frames.push(fullResponse.subarray(offset, offset + msgLen));
     offset += msgLen;
   }
 
-  // Fallback: try raw protobuf if Connect framing didn't match
-  if (allTexts.length === 0) {
-    const texts = extractContentFromReactiveUpdate(fullResponse);
-    allTexts.push(...texts);
+  // Extract the growing assistant response across frames.
+  // Frame sequence: config → user message → bot marker → growing response → stats
+  // The response text is in f15 fields, cumulative across frames.
+  let phase: 'pre-user' | 'pre-bot' | 'response' | 'done' = 'pre-user';
+  let longestResponse = '';
+
+  for (const frame of frames) {
+    const frameStr = frame.toString('utf8');
+
+    if (phase === 'pre-user') {
+      if (frameStr.includes(userMessage.substring(0, Math.min(20, userMessage.length)))) {
+        phase = 'pre-bot';
+      }
+      continue;
+    }
+
+    if (phase === 'pre-bot') {
+      if (frameStr.includes('bot-')) {
+        phase = 'response';
+      }
+      // Extract from the bot-marker frame too (it may have the first word)
+      if (phase === 'response') {
+        const texts = extractContentFromReactiveUpdate(frame);
+        for (const t of texts) {
+          if (t.length > longestResponse.length) longestResponse = t;
+        }
+      }
+      continue;
+    }
+
+    if (phase === 'response') {
+      if (frameStr.includes('Response Statistics')) {
+        phase = 'done';
+        continue;
+      }
+      // Extract f15 content from response frames (no bot-marker filter needed here)
+      const texts = extractAllF15Strings(frame);
+      for (const t of texts) {
+        if (t.length > longestResponse.length) longestResponse = t;
+      }
+    }
   }
 
-  if (allTexts.length > 0) {
-    yield allTexts.join('');
+  if (longestResponse) {
+    yield longestResponse;
   }
 }
 
