@@ -228,9 +228,8 @@ export function getPort(): number {
     );
   }
   
-  // Extract PID from ps output (second column)
-  const pidMatch = processInfo.match(/^\s*\S+\s+(\d+)/);
-  const pid = pidMatch ? pidMatch[1] : null;
+  // Extract PID from ps output (handles both ps aux and ps eww formats)
+  const pid = getLanguageServerPid(processInfo);
   
   // Get extension_server_port as a reference point
   const portMatch = processInfo.match(/--extension_server_port\s+(\d+)/);
