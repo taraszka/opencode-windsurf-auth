@@ -125,11 +125,22 @@ function getLanguageServerProcess(): string | null {
 }
 
 /**
- * Extract the PID of the language server from ps output
+ * Extract the PID of the language server from ps output.
+ * Handles both `ps aux` format (USER PID ...) and `ps eww` format (PID TT ...).
  */
 function getLanguageServerPid(processInfo: string): string | null {
-  const pidMatch = processInfo.match(/^\s*\S+\s+(\d+)/);
-  return pidMatch ? pidMatch[1] : null;
+  // Try to find a line containing the language server binary and extract its PID
+  const pattern = getLanguageServerPattern();
+  for (const line of processInfo.split('\n')) {
+    if (line.includes(pattern)) {
+      // ps aux: "user  PID ..." / ps eww: " PID  TT ..."
+      const match = line.match(/(\d+)/);
+      if (match) return match[1];
+    }
+  }
+  // Fallback: first number on any non-header line
+  const match = processInfo.match(/^\s*(\d+)/m);
+  return match ? match[1] : null;
 }
 
 /**
