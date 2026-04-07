@@ -203,6 +203,59 @@ const VARIANT_CATALOG: Record<string, ModelCatalogEntry> = {
   },
 };
 
+// ============================================================================
+// Enum-less models (server uses model_uid string, not protobuf enum)
+// Maps all accepted aliases → exact server model UID
+// ============================================================================
+
+const SERVER_MODEL_ID: Record<string, string> = {
+  // Claude Opus 4.6
+  'claude-opus-4-6': 'claude-opus-4-6',
+  'claude-4.6-opus': 'claude-opus-4-6',
+  'claude-4-6-opus': 'claude-opus-4-6',
+  'claude-opus-4.6': 'claude-opus-4-6',
+
+  'claude-opus-4-6-thinking': 'claude-opus-4-6-thinking',
+  'claude-4.6-opus-thinking': 'claude-opus-4-6-thinking',
+  'claude-4-6-opus-thinking': 'claude-opus-4-6-thinking',
+  'claude-opus-4.6-thinking': 'claude-opus-4-6-thinking',
+
+  'claude-opus-4-6-1m': 'claude-opus-4-6-1m',
+  'claude-4.6-opus-1m': 'claude-opus-4-6-1m',
+  'claude-opus-4.6-1m': 'claude-opus-4-6-1m',
+
+  'claude-opus-4-6-thinking-1m': 'claude-opus-4-6-thinking-1m',
+  'claude-4.6-opus-thinking-1m': 'claude-opus-4-6-thinking-1m',
+  'claude-opus-4.6-thinking-1m': 'claude-opus-4-6-thinking-1m',
+
+  'claude-opus-4-6-fast': 'claude-opus-4-6-fast',
+  'claude-4.6-opus-fast': 'claude-opus-4-6-fast',
+  'claude-opus-4.6-fast': 'claude-opus-4-6-fast',
+
+  'claude-opus-4-6-thinking-fast': 'claude-opus-4-6-thinking-fast',
+  'claude-4.6-opus-thinking-fast': 'claude-opus-4-6-thinking-fast',
+  'claude-opus-4.6-thinking-fast': 'claude-opus-4-6-thinking-fast',
+
+  // Claude Sonnet 4.6
+  'claude-sonnet-4-6': 'claude-sonnet-4-6',
+  'claude-4.6-sonnet': 'claude-sonnet-4-6',
+  'claude-4-6-sonnet': 'claude-sonnet-4-6',
+  'claude-sonnet-4.6': 'claude-sonnet-4-6',
+
+  'claude-sonnet-4-6-thinking': 'claude-sonnet-4-6-thinking',
+  'claude-4.6-sonnet-thinking': 'claude-sonnet-4-6-thinking',
+  'claude-4-6-sonnet-thinking': 'claude-sonnet-4-6-thinking',
+  'claude-sonnet-4.6-thinking': 'claude-sonnet-4-6-thinking',
+
+  'claude-sonnet-4-6-1m': 'claude-sonnet-4-6-1m',
+  'claude-4.6-sonnet-1m': 'claude-sonnet-4-6-1m',
+  'claude-sonnet-4.6-1m': 'claude-sonnet-4-6-1m',
+
+  'claude-sonnet-4-6-thinking-1m': 'claude-sonnet-4-6-thinking-1m',
+  'claude-4.6-sonnet-thinking-1m': 'claude-sonnet-4-6-thinking-1m',
+  'claude-sonnet-4.6-thinking-1m': 'claude-sonnet-4-6-thinking-1m',
+};
+
 const VARIANT_NAME_SET = new Set<string>();
 for (const entry of Object.values(VARIANT_CATALOG)) {
   if (entry.variants) {
@@ -309,6 +362,53 @@ const MODEL_NAME_TO_ENUM: Record<string, ModelEnumValue> = {
   'claude-4-5-opus-thinking': ModelEnum.CLAUDE_4_5_OPUS_THINKING,
   
   'claude-code': ModelEnum.CLAUDE_CODE,
+
+  // ============================================================================
+  // Claude 4.6 Models (no protobuf enum — resolved via chat_model_name string)
+  // ============================================================================
+  'claude-opus-4-6': ModelEnum.MODEL_UNSPECIFIED,
+  'claude-4.6-opus': ModelEnum.MODEL_UNSPECIFIED,
+  'claude-4-6-opus': ModelEnum.MODEL_UNSPECIFIED,
+  'claude-opus-4.6': ModelEnum.MODEL_UNSPECIFIED,
+
+  'claude-opus-4-6-thinking': ModelEnum.MODEL_UNSPECIFIED,
+  'claude-4.6-opus-thinking': ModelEnum.MODEL_UNSPECIFIED,
+  'claude-4-6-opus-thinking': ModelEnum.MODEL_UNSPECIFIED,
+  'claude-opus-4.6-thinking': ModelEnum.MODEL_UNSPECIFIED,
+
+  'claude-opus-4-6-1m': ModelEnum.MODEL_UNSPECIFIED,
+  'claude-4.6-opus-1m': ModelEnum.MODEL_UNSPECIFIED,
+  'claude-opus-4.6-1m': ModelEnum.MODEL_UNSPECIFIED,
+
+  'claude-opus-4-6-thinking-1m': ModelEnum.MODEL_UNSPECIFIED,
+  'claude-4.6-opus-thinking-1m': ModelEnum.MODEL_UNSPECIFIED,
+  'claude-opus-4.6-thinking-1m': ModelEnum.MODEL_UNSPECIFIED,
+
+  'claude-opus-4-6-fast': ModelEnum.MODEL_UNSPECIFIED,
+  'claude-4.6-opus-fast': ModelEnum.MODEL_UNSPECIFIED,
+  'claude-opus-4.6-fast': ModelEnum.MODEL_UNSPECIFIED,
+
+  'claude-opus-4-6-thinking-fast': ModelEnum.MODEL_UNSPECIFIED,
+  'claude-4.6-opus-thinking-fast': ModelEnum.MODEL_UNSPECIFIED,
+  'claude-opus-4.6-thinking-fast': ModelEnum.MODEL_UNSPECIFIED,
+
+  'claude-sonnet-4-6': ModelEnum.MODEL_UNSPECIFIED,
+  'claude-4.6-sonnet': ModelEnum.MODEL_UNSPECIFIED,
+  'claude-4-6-sonnet': ModelEnum.MODEL_UNSPECIFIED,
+  'claude-sonnet-4.6': ModelEnum.MODEL_UNSPECIFIED,
+
+  'claude-sonnet-4-6-thinking': ModelEnum.MODEL_UNSPECIFIED,
+  'claude-4.6-sonnet-thinking': ModelEnum.MODEL_UNSPECIFIED,
+  'claude-4-6-sonnet-thinking': ModelEnum.MODEL_UNSPECIFIED,
+  'claude-sonnet-4.6-thinking': ModelEnum.MODEL_UNSPECIFIED,
+
+  'claude-sonnet-4-6-1m': ModelEnum.MODEL_UNSPECIFIED,
+  'claude-4.6-sonnet-1m': ModelEnum.MODEL_UNSPECIFIED,
+  'claude-sonnet-4.6-1m': ModelEnum.MODEL_UNSPECIFIED,
+
+  'claude-sonnet-4-6-thinking-1m': ModelEnum.MODEL_UNSPECIFIED,
+  'claude-4.6-sonnet-thinking-1m': ModelEnum.MODEL_UNSPECIFIED,
+  'claude-sonnet-4.6-thinking-1m': ModelEnum.MODEL_UNSPECIFIED,
 
   // ============================================================================
   // GPT Models
@@ -641,8 +741,10 @@ export function resolveModel(modelName: string, variantOverride?: string): {
   // Fallback to legacy map
   const normalized = normalizeModelId(modelName);
   const enumValue = MODEL_NAME_TO_ENUM[normalized];
-  if (enumValue) {
-    return { enumValue, modelId: normalized };
+  if (enumValue !== undefined) {
+    // For enum-less models (MODEL_UNSPECIFIED), use the server model UID
+    const modelId = SERVER_MODEL_ID[normalized] || normalized;
+    return { enumValue, modelId };
   }
 
   return { enumValue: ModelEnum.CLAUDE_3_5_SONNET_20241022, modelId: 'claude-3.5-sonnet' };
@@ -705,6 +807,20 @@ export function getDefaultModelEnum(): ModelEnumValue {
   return ModelEnum.CLAUDE_3_5_SONNET_20241022;
 }
 
+/** Canonical model names for enum-less models (server UID based) */
+const ENUMLESS_CANONICAL_MODELS = [
+  'claude-opus-4-6',
+  'claude-opus-4-6-thinking',
+  'claude-opus-4-6-1m',
+  'claude-opus-4-6-thinking-1m',
+  'claude-opus-4-6-fast',
+  'claude-opus-4-6-thinking-fast',
+  'claude-sonnet-4-6',
+  'claude-sonnet-4-6-thinking',
+  'claude-sonnet-4-6-1m',
+  'claude-sonnet-4-6-thinking-1m',
+];
+
 /**
  * Canonical models (no variants), aligned with OpenCode listing
  */
@@ -716,6 +832,11 @@ export function getCanonicalModels(): string[] {
     if (!name) continue;
     if (VARIANT_NAME_SET.has(name)) continue; // skip variant entries
     if (!bases.has(name)) bases.add(name);
+  }
+
+  // Add enum-less canonical models
+  for (const name of ENUMLESS_CANONICAL_MODELS) {
+    bases.add(name);
   }
 
   return Array.from(bases).sort();
