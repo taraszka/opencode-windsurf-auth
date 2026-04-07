@@ -71,10 +71,10 @@ async function runWindsurfOnce(
   prompt: string
 ): Promise<string> {
   const chunks: string[] = [];
-  const generator = streamChatGenerator(credentials, {
-    model,
-    messages: [{ role: 'user', content: prompt }],
-  });
+  const resolved = resolveModel(model);
+  const generator = requiresCascadeProtocol(resolved.enumValue)
+    ? streamCascadeChat(credentials, { model: resolved.modelId, messages: [{ role: 'user', content: prompt }] })
+    : streamChatGenerator(credentials, { model, messages: [{ role: 'user', content: prompt }] });
   for await (const chunk of generator) {
     chunks.push(chunk);
   }
