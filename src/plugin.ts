@@ -18,6 +18,7 @@ import * as crypto from 'crypto';
 import type { PluginInput, Hooks } from '@opencode-ai/plugin';
 import { getCredentials, isWindsurfRunning, WindsurfCredentials } from './plugin/auth.js';
 import { streamChatGenerator, ChatMessage } from './plugin/grpc-client.js';
+import { streamCascadeChat, requiresCascadeProtocol } from './plugin/cascade-client.js';
 import {
   getDefaultModel,
   getCanonicalModels,
@@ -507,7 +508,7 @@ function createStreamingResponse(
   return new ReadableStream({
     async start(controller) {
       try {
-        // Convert messages to the format expected by gRPC client
+        // Convert messages
         const messages: ChatMessage[] = request.messages
           .filter((m) => m.role !== 'assistant' && m.role !== 'tool')
           .map((m) => ({
@@ -518,10 +519,10 @@ function createStreamingResponse(
                 : m.content.map((p) => p.text || '').join(''),
           }));
 
-        const generator = streamChatGenerator(credentials, {
-          model: effectiveModel,
-          messages,
-        });
+        // Route: Cascade protocol for enum-less models, gRPC for the rest
+        const generator = requiresCascadeProtocol(resolved.enumValue)
+          ? streamCascadeChat(credentials, { model: effectiveModel, messages })
+          : streamChatGenerator(credentials, { model: effectiveModel, messages });
 
         let firstChunk = true;
         let accum = '';
@@ -625,10 +626,10 @@ async function createNonStreamingResponse(
           : m.content.map((p) => p.text || '').join(''),
     }));
 
-  const generator = streamChatGenerator(credentials, {
-    model: effectiveModel,
-    messages,
-  });
+  // Route: Cascade protocol for enum-less models, gRPC for the rest
+  const generator = requiresCascadeProtocol(resolved.enumValue)
+    ? streamCascadeChat(credentials, { model: effectiveModel, messages })
+    : streamChatGenerator(credentials, { model: effectiveModel, messages });
 
   for await (const chunk of generator) {
     chunks.push(chunk);
