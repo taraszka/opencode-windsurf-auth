@@ -242,59 +242,6 @@ function parseProtoFields(buffer: Buffer): Array<{
 }
 
 /**
- * Extract assistant response text from a Cascade reactive update frame.
- *
- * The assistant's text is in f15 strings inside frames that contain a "bot-" UUID.
- * We only extract from frames with the bot marker to avoid system prompt leakage.
- */
-function extractContentFromReactiveUpdate(buffer: Buffer): string[] {
-  // Only extract from frames containing the bot marker (assistant messages)
-  const frameStr = buffer.toString('utf8');
-  if (!frameStr.includes('bot-')) return [];
-
-  const texts: string[] = [];
-
-  function collectF15(buf: Buffer): void {
-    const fields = parseProtoFields(buf);
-    for (const f of fields) {
-      if (f.wireType !== 2 || !f.data) continue;
-      const str = f.data.toString('utf8');
-      const isPrintable = f.data.length > 0 && /^[\x20-\x7e\n\r\t\u00a0-\uffff]+$/.test(str);
-
-      if (f.fieldNum === 15 && isPrintable) {
-        // Filter out known metadata strings
-        if (
-          !/^[a-f0-9-]{10,}$/.test(str) &&
-          !/^MODEL_/.test(str) &&
-          !/^claude-/.test(str) &&
-          !/^\//.test(str) &&
-          !/^windsurf$/i.test(str) &&
-          !/^bot-/.test(str) &&
-          !/^z[\$a-f0-9]/.test(str) &&
-          !/^[a-zA-Z0-9]{20,}$/.test(str) && // random ID strings
-          !/^(Response Statistics|Credits spent|credits?|model|Model| credits?|yaml|trafficType)$/i.test(str) &&
-          !/^Claude (Opus|Sonnet|Haiku|Code)/.test(str)
-        ) {
-          texts.push(str);
-        }
-      } else if (!isPrintable && f.data.length > 2) {
-        collectF15(f.data);
-      }
-    }
-  }
-
-  collectF15(buffer);
-
-  // Deduplicate (the cascade sends content twice - once in the message, once in a copy)
-  const seen = new Set<string>();
-  return texts.filter(t => {
-    if (seen.has(t)) return false;
-    seen.add(t);
-    return true;
-  });
-}
-
-/**
  * Extract ALL f15 printable strings from a protobuf buffer (no bot-marker filter).
  * Used for response frames after the bot marker has been seen.
  */
@@ -462,81 +409,51 @@ export async function* streamCascadeChat(
     );
   }
 
-  // Step 4: Process frames incrementally, yielding text deltas as they arrive
-  let phase: 'pre-user' | 'pre-bot' | 'response' | 'done' = 'pre-user';
-  let previousText = '';
-  let frameIdx = 0;
+  // Step 4: Wait for completion, then extract the final response.
+  // Cascade agents use tools (file reads, searches) which produce noise in f15 fields.
+  // We wait for "Response Statistics" or timeout, then pick the longest
+  // natural-language string as the response.
+  while (!streamDone) {
+    await new Promise<void>((r) => { resolveWait = r; });
+    resolveWait = null;
 
-  while (!streamDone || frameIdx < frameQueue.length) {
-    // Wait for new frames
-    if (frameIdx >= frameQueue.length && !streamDone) {
-      await new Promise<void>((r) => { resolveWait = r; });
-      resolveWait = null;
+    // Check for completion signal
+    for (let i = frameQueue.length - 1; i >= Math.max(0, frameQueue.length - 3); i--) {
+      if (frameQueue[i]?.toString('utf8').includes('Response Statistics')) {
+        streamDone = true;
+        break;
+      }
     }
-
-    // Process new frames
-    while (frameIdx < frameQueue.length) {
-      const frame = frameQueue[frameIdx++];
-      const frameStr = frame.toString('utf8');
-
-      if (phase === 'pre-user') {
-        if (frameStr.includes(userMessage.substring(0, Math.min(20, userMessage.length)))) {
-          phase = 'pre-bot';
-        }
-        continue;
-      }
-
-      if (phase === 'pre-bot') {
-        if (frameStr.includes('bot-')) {
-          phase = 'response';
-          const texts = extractContentFromReactiveUpdate(frame);
-          for (const t of texts) {
-            if (t.length > previousText.length) {
-              const delta = t.substring(previousText.length);
-              if (delta) yield delta;
-              previousText = t;
-            }
-          }
-        }
-        continue;
-      }
-
-      if (phase === 'response') {
-        if (frameStr.includes('Response Statistics')) {
-          phase = 'done';
-          streamDone = true;
-          break;
-        }
-        // Find the longest f15 string in this frame (the assistant's cumulative text).
-        // Each frame's longest f15 is the full response so far.
-        const texts = frameStr.includes('bot-')
-          ? extractContentFromReactiveUpdate(frame)
-          : extractAllF15Strings(frame);
-        let frameBest = '';
-        for (const t of texts) {
-          if (t.length > frameBest.length) frameBest = t;
-        }
-        // Yield delta if text grew
-        if (frameBest.length > previousText.length) {
-          if (frameBest.startsWith(previousText)) {
-            // Cumulative extension — yield only the new part
-            const delta = frameBest.substring(previousText.length);
-            if (delta) yield delta;
-          } else {
-            // New turn (after tool use) — yield the full new text
-            yield frameBest;
-          }
-          previousText = frameBest;
-        }
-      }
-
-      if (streamDone) break;
-    }
-
-    if (phase === 'done') break;
   }
 
   try { streamReq.destroy(); } catch {}
+
+  // Find the longest natural-language f15 string across all post-user frames
+  let userSeen = false;
+  let bestResponse = '';
+
+  for (const frame of frameQueue) {
+    const frameStr = frame.toString('utf8');
+    if (!userSeen) {
+      if (frameStr.includes(userMessage.substring(0, Math.min(20, userMessage.length)))) {
+        userSeen = true;
+      }
+      continue;
+    }
+    if (frameStr.includes('Response Statistics')) break;
+
+    const texts = extractAllF15Strings(frame);
+    for (const t of texts) {
+      // Must contain a space (natural language, not tool_name or file.path)
+      if (t.length > bestResponse.length && t.includes(' ')) {
+        bestResponse = t;
+      }
+    }
+  }
+
+  if (bestResponse) {
+    yield bestResponse;
+  }
 }
 
 /**
