@@ -384,62 +384,47 @@ export async function* streamCascadeChat(
   streamEnvelope.writeUInt32BE(streamProto.length, 1);
   streamProto.copy(streamEnvelope, 5);
 
-  let markMessageSent: () => void = () => {};
+  // Step 2b: Set up frame queue for incremental processing
+  const frameQueue: Buffer[] = [];
+  let streamDone = false;
+  let resolveWait: (() => void) | null = null;
 
-  const streamPromise = new Promise<Buffer[]>((resolve) => {
-    const chunks: Buffer[] = [];
-    let settled = false;
-    let idleTimer: ReturnType<typeof setTimeout> | null = null;
-    let messageSent = false;
-
-    function settleStream() {
-      if (settled) return;
-      settled = true;
-      if (idleTimer) clearTimeout(idleTimer);
-      resolve(chunks);
-    }
-
-    function resetIdleTimer() {
-      if (!messageSent) return;
-      if (idleTimer) clearTimeout(idleTimer);
-      idleTimer = setTimeout(settleStream, 180000);
-    }
-
-    markMessageSent = () => { messageSent = true; resetIdleTimer(); };
-
-    const streamReq = http.request(
-      {
-        hostname: '127.0.0.1',
-        port,
-        path: '/exa.language_server_pb.LanguageServerService/StreamCascadeReactiveUpdates',
-        method: 'POST',
-        headers: {
-          'content-type': 'application/connect+proto',
-          'connect-protocol-version': '1',
-          'x-codeium-csrf-token': csrfToken,
-        },
+  const streamReq = http.request(
+    {
+      hostname: '127.0.0.1',
+      port,
+      path: '/exa.language_server_pb.LanguageServerService/StreamCascadeReactiveUpdates',
+      method: 'POST',
+      headers: {
+        'content-type': 'application/connect+proto',
+        'connect-protocol-version': '1',
+        'x-codeium-csrf-token': csrfToken,
       },
-      (res) => {
-        res.on('data', (chunk: Buffer) => {
-          chunks.push(chunk);
-          // Check if this chunk contains the completion signal
-          if (messageSent && chunk.toString('utf8').includes('Response Statistics')) {
-            // Give a short grace period for any trailing frames
-            if (idleTimer) clearTimeout(idleTimer);
-            idleTimer = setTimeout(settleStream, 1000);
-          } else {
-            resetIdleTimer();
+    },
+    (res) => {
+      res.on('data', (chunk: Buffer) => {
+        // Parse Connect envelope frames from chunk
+        let off = 0;
+        while (off + 5 <= chunk.length) {
+          const flags = chunk[off];
+          const len = chunk.readUInt32BE(off + 1);
+          off += 5;
+          if (off + len > chunk.length) break;
+          if (flags !== 2) {
+            frameQueue.push(chunk.subarray(off, off + len));
           }
-        });
-        res.on('end', settleStream);
-        res.on('error', () => settleStream());
-      }
-    );
-    streamReq.on('error', () => settleStream());
-    streamReq.write(streamEnvelope);
-    streamReq.end();
-    setTimeout(settleStream, 180000);
-  });
+          off += len;
+        }
+        resolveWait?.();
+      });
+      res.on('end', () => { streamDone = true; resolveWait?.(); });
+      res.on('error', () => { streamDone = true; resolveWait?.(); });
+    }
+  );
+  streamReq.on('error', () => { streamDone = true; resolveWait?.(); });
+  streamReq.write(streamEnvelope);
+  streamReq.end();
+  setTimeout(() => { streamDone = true; resolveWait?.(); }, 180000);
 
   await new Promise((r) => setTimeout(r, 300));
 
@@ -464,82 +449,71 @@ export async function* streamCascadeChat(
     );
   }
 
-  // Signal that message was sent so idle timer starts
-  markMessageSent();
-
-  // Step 4: Wait for streaming response
-  const responseChunks = await streamPromise;
-  const fullResponse = Buffer.concat(responseChunks);
-  if (fullResponse.length === 0) {
-    throw new WindsurfError(
-      'Empty response from Cascade stream',
-      WindsurfErrorCode.STREAM_ERROR
-    );
-  }
-
-  // Parse Connect protocol streaming response
-  // Each chunk is envelope-framed: 1 byte flags + 4 bytes length + protobuf
-  // The stream contains: cascade config → user message echo → bot response → stats
-  // We only want the bot response text, which appears AFTER the user message.
-  let offset = 0;
-  const frames: Buffer[] = [];
-
-  while (offset + 5 <= fullResponse.length) {
-    const flags = fullResponse[offset];
-    const msgLen = fullResponse.readUInt32BE(offset + 1);
-    offset += 5;
-    if (offset + msgLen > fullResponse.length) break;
-    if (flags === 2) break;
-    frames.push(fullResponse.subarray(offset, offset + msgLen));
-    offset += msgLen;
-  }
-
-  // Extract the growing assistant response across frames.
-  // Frame sequence: config → user message → bot marker → growing response → stats
-  // The response text is in f15 fields, cumulative across frames.
+  // Step 4: Process frames incrementally, yielding text deltas as they arrive
   let phase: 'pre-user' | 'pre-bot' | 'response' | 'done' = 'pre-user';
-  let longestResponse = '';
+  let previousText = '';
+  let frameIdx = 0;
 
-  for (const frame of frames) {
-    const frameStr = frame.toString('utf8');
-
-    if (phase === 'pre-user') {
-      if (frameStr.includes(userMessage.substring(0, Math.min(20, userMessage.length)))) {
-        phase = 'pre-bot';
-      }
-      continue;
+  while (!streamDone || frameIdx < frameQueue.length) {
+    // Wait for new frames
+    if (frameIdx >= frameQueue.length && !streamDone) {
+      await new Promise<void>((r) => { resolveWait = r; });
+      resolveWait = null;
     }
 
-    if (phase === 'pre-bot') {
-      if (frameStr.includes('bot-')) {
-        phase = 'response';
-      }
-      // Extract from the bot-marker frame too (it may have the first word)
-      if (phase === 'response') {
-        const texts = extractContentFromReactiveUpdate(frame);
-        for (const t of texts) {
-          if (t.length > longestResponse.length) longestResponse = t;
+    // Process new frames
+    while (frameIdx < frameQueue.length) {
+      const frame = frameQueue[frameIdx++];
+      const frameStr = frame.toString('utf8');
+
+      if (phase === 'pre-user') {
+        if (frameStr.includes(userMessage.substring(0, Math.min(20, userMessage.length)))) {
+          phase = 'pre-bot';
         }
-      }
-      continue;
-    }
-
-    if (phase === 'response') {
-      if (frameStr.includes('Response Statistics')) {
-        phase = 'done';
         continue;
       }
-      // Extract f15 content from response frames (no bot-marker filter needed here)
-      const texts = extractAllF15Strings(frame);
-      for (const t of texts) {
-        if (t.length > longestResponse.length) longestResponse = t;
+
+      if (phase === 'pre-bot') {
+        if (frameStr.includes('bot-')) {
+          phase = 'response';
+          const texts = extractContentFromReactiveUpdate(frame);
+          for (const t of texts) {
+            if (t.length > previousText.length) {
+              const delta = t.substring(previousText.length);
+              if (delta) yield delta;
+              previousText = t;
+            }
+          }
+        }
+        continue;
       }
+
+      if (phase === 'response') {
+        if (frameStr.includes('Response Statistics')) {
+          phase = 'done';
+          streamDone = true;
+          break;
+        }
+        // Extract growing text and yield delta
+        const texts = frameStr.includes('bot-')
+          ? extractContentFromReactiveUpdate(frame)
+          : extractAllF15Strings(frame);
+        for (const t of texts) {
+          if (t.length > previousText.length) {
+            const delta = t.substring(previousText.length);
+            if (delta) yield delta;
+            previousText = t;
+          }
+        }
+      }
+
+      if (streamDone) break;
     }
+
+    if (phase === 'done') break;
   }
 
-  if (longestResponse) {
-    yield longestResponse;
-  }
+  try { streamReq.destroy(); } catch {}
 }
 
 /**
