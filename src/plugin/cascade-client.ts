@@ -402,7 +402,7 @@ export async function* streamCascadeChat(
     function resetIdleTimer() {
       if (!messageSent) return;
       if (idleTimer) clearTimeout(idleTimer);
-      idleTimer = setTimeout(settleStream, 90000);
+      idleTimer = setTimeout(settleStream, 180000);
     }
 
     markMessageSent = () => { messageSent = true; resetIdleTimer(); };
