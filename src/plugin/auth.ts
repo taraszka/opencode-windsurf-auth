@@ -99,7 +99,7 @@ function getLanguageServerProcess(): string | null {
     } else {
       // Unix-like: use ps
       const output = execSync(
-        `ps aux | grep ${pattern}`,
+        `ps aux | grep ${pattern} | grep -v grep`,
         { encoding: 'utf8', timeout: 5000 }
       );
       return output;
