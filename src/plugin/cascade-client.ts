@@ -507,15 +507,21 @@ export async function* streamCascadeChat(
           streamDone = true;
           break;
         }
-        // Extract growing text and yield delta
+        // Extract growing text and yield delta.
+        // The assistant's response is cumulative: each frame's longest f15
+        // should START WITH the previous text (it's the same text + more).
+        // This filters out filenames and other f15 noise.
         const texts = frameStr.includes('bot-')
           ? extractContentFromReactiveUpdate(frame)
           : extractAllF15Strings(frame);
         for (const t of texts) {
           if (t.length > previousText.length) {
-            const delta = t.substring(previousText.length);
-            if (delta) yield delta;
-            previousText = t;
+            // Must be a cumulative extension OR the first text
+            if (previousText.length === 0 || t.startsWith(previousText)) {
+              const delta = t.substring(previousText.length);
+              if (delta) yield delta;
+              previousText = t;
+            }
           }
         }
       }
