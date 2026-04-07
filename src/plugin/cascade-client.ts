@@ -402,7 +402,7 @@ export async function* streamCascadeChat(
     function resetIdleTimer() {
       if (!messageSent) return;
       if (idleTimer) clearTimeout(idleTimer);
-      idleTimer = setTimeout(settleStream, 8000);
+      idleTimer = setTimeout(settleStream, 30000);
     }
 
     markMessageSent = () => { messageSent = true; resetIdleTimer(); };
@@ -422,7 +422,14 @@ export async function* streamCascadeChat(
       (res) => {
         res.on('data', (chunk: Buffer) => {
           chunks.push(chunk);
-          resetIdleTimer();
+          // Check if this chunk contains the completion signal
+          if (messageSent && chunk.toString('utf8').includes('Response Statistics')) {
+            // Give a short grace period for any trailing frames
+            if (idleTimer) clearTimeout(idleTimer);
+            idleTimer = setTimeout(settleStream, 1000);
+          } else {
+            resetIdleTimer();
+          }
         });
         res.on('end', settleStream);
         res.on('error', () => settleStream());
@@ -431,7 +438,7 @@ export async function* streamCascadeChat(
     streamReq.on('error', () => settleStream());
     streamReq.write(streamEnvelope);
     streamReq.end();
-    setTimeout(settleStream, 120000);
+    setTimeout(settleStream, 180000);
   });
 
   await new Promise((r) => setTimeout(r, 300));
