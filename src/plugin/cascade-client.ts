@@ -507,22 +507,26 @@ export async function* streamCascadeChat(
           streamDone = true;
           break;
         }
-        // Extract growing text and yield delta.
-        // The assistant's response is cumulative: each frame's longest f15
-        // should START WITH the previous text (it's the same text + more).
-        // This filters out filenames and other f15 noise.
+        // Find the longest f15 string in this frame (the assistant's cumulative text).
+        // Each frame's longest f15 is the full response so far.
         const texts = frameStr.includes('bot-')
           ? extractContentFromReactiveUpdate(frame)
           : extractAllF15Strings(frame);
+        let frameBest = '';
         for (const t of texts) {
-          if (t.length > previousText.length) {
-            // Must be a cumulative extension OR the first text
-            if (previousText.length === 0 || t.startsWith(previousText)) {
-              const delta = t.substring(previousText.length);
-              if (delta) yield delta;
-              previousText = t;
-            }
+          if (t.length > frameBest.length) frameBest = t;
+        }
+        // Yield delta if text grew
+        if (frameBest.length > previousText.length) {
+          if (frameBest.startsWith(previousText)) {
+            // Cumulative extension — yield only the new part
+            const delta = frameBest.substring(previousText.length);
+            if (delta) yield delta;
+          } else {
+            // New turn (after tool use) — yield the full new text
+            yield frameBest;
           }
+          previousText = frameBest;
         }
       }
 
