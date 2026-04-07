@@ -307,14 +307,27 @@ function extractAllF15Strings(buffer: Buffer): string[] {
       const str = f.data.toString('utf8');
       const isPrintable = f.data.length > 0 && /^[\x20-\x7e\n\r\t\u00a0-\uffff]+$/.test(str);
       if (f.fieldNum === 15 && isPrintable && f.data.length > 1) {
-        texts.push(str);
+        // Filter metadata noise (same filters as extractContentFromReactiveUpdate)
+        if (
+          !/^[a-f0-9-]{10,}$/.test(str) &&
+          !/^MODEL_/.test(str) &&
+          !/^claude-/.test(str) &&
+          !/^\//.test(str) &&
+          !/^windsurf$/i.test(str) &&
+          !/^bot-/.test(str) &&
+          !/^z[\$a-f0-9]/.test(str) &&
+          !/^[a-zA-Z0-9_]{20,}$/.test(str) &&
+          !/^(Response Statistics|Credits spent|credits?|model|Model| credits?|yaml|trafficType)$/i.test(str) &&
+          !/^Claude (Opus|Sonnet|Haiku|Code)/.test(str)
+        ) {
+          texts.push(str);
+        }
       } else if (!isPrintable && f.data.length > 2) {
         walk(f.data);
       }
     }
   }
   walk(buffer);
-  // Deduplicate
   const seen = new Set<string>();
   return texts.filter(t => {
     if (seen.has(t)) return false;
