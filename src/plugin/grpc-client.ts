@@ -252,10 +252,12 @@ function buildChatRequest(
     request.push(...encodeString(3, systemPrompt));
   }
 
-  // Field 4: model enum
-  request.push(...encodeVarintField(4, modelEnum));
+  // Field 4: model enum (skip for MODEL_UNSPECIFIED to let field 5 take precedence)
+  if (modelEnum > 0) {
+    request.push(...encodeVarintField(4, modelEnum));
+  }
 
-  // Field 5: chat_model_name (string) if provided
+  // Field 5: chat_model_name (string) — required for enum-less models like Claude 4.6
   if (modelName) {
     request.push(...encodeString(5, modelName));
   }
