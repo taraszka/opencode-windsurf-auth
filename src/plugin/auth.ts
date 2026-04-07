@@ -87,7 +87,7 @@ function getLanguageServerPattern(): string {
  */
 function getLanguageServerProcess(): string | null {
   const pattern = getLanguageServerPattern();
-  
+
   try {
     if (process.platform === 'win32') {
       // Windows: use WMIC
@@ -97,12 +97,27 @@ function getLanguageServerProcess(): string | null {
       );
       return output;
     } else {
-      // Unix-like: use ps
-      const output = execSync(
-        `ps aux | grep ${pattern} | grep -v grep`,
-        { encoding: 'utf8', timeout: 5000 }
-      );
-      return output;
+      // Unix-like: use pgrep + ps to avoid shell pipe issues under Bun runtime
+      try {
+        const pids = execSync(
+          `pgrep -f ${pattern}`,
+          { encoding: 'utf8', timeout: 5000 }
+        ).trim();
+        if (pids) {
+          const firstPid = pids.split('\n')[0].trim();
+          const output = execSync(
+            `ps eww -p ${firstPid}`,
+            { encoding: 'utf8', timeout: 5000 }
+          );
+          return output;
+        }
+      } catch {
+        // pgrep not available, fall back to ps aux with JS-side filtering
+      }
+      // Fallback: get all processes and filter in JS (avoids shell pipe issues)
+      const output = execSync('ps aux', { encoding: 'utf8', timeout: 5000 });
+      const lines = output.split('\n').filter(line => line.includes(pattern));
+      return lines.length > 0 ? lines.join('\n') : null;
     }
   } catch {
     return null;
@@ -128,6 +143,13 @@ function getCSRFTokenFromEnv(processInfo: string): string | null {
     return null;
   }
 
+  // First check if processInfo already contains env vars (pgrep+ps eww path)
+  const directMatch = processInfo.match(/WINDSURF_CSRF_TOKEN=([a-f0-9-]+)/);
+  if (directMatch?.[1]) {
+    return directMatch[1];
+  }
+
+  // Otherwise, get PID and fetch env via ps eww
   const pid = getLanguageServerPid(processInfo);
   if (!pid) {
     return null;
