@@ -465,6 +465,29 @@ function createOpenAICompatibleResponse(
   };
 }
 
+// ============================================================================
+// Windsurf Backend Error Detection
+// ============================================================================
+
+const WINDSURF_ERROR_PATTERN = /^(permission_denied|invalid_argument|unknown|resource_exhausted|unavailable|unauthenticated|not_found|internal):\s*(.+)/s;
+
+function detectWindsurfError(content: string): { status: number; message: string } | null {
+  const match = content.trim().match(WINDSURF_ERROR_PATTERN);
+  if (!match) return null;
+  const [, code, message] = match;
+  const statusMap: Record<string, number> = {
+    permission_denied: 403,
+    invalid_argument: 400,
+    not_found: 404,
+    resource_exhausted: 429,
+    unauthenticated: 401,
+    unavailable: 503,
+    unknown: 502,
+    internal: 500,
+  };
+  return { status: statusMap[code] || 500, message: `Windsurf: ${message.trim()}` };
+}
+
 /**
  * Create a streaming response using the gRPC generator
  */
@@ -500,7 +523,14 @@ function createStreamingResponse(
           messages,
         });
 
+        let firstChunk = true;
+        let accum = '';
         for await (const chunk of generator) {
+          // Buffer initial content to detect single-chunk error responses
+          if (firstChunk) {
+            accum += chunk;
+            continue;
+          }
           const responseChunk = createOpenAICompatibleResponse(
             responseId,
             requestedModel,
@@ -511,6 +541,33 @@ function createStreamingResponse(
             encoder.encode(`data: ${JSON.stringify(responseChunk)}\n\n`)
           );
         }
+
+        // Check if the entire response was a Windsurf backend error
+        if (firstChunk && accum) {
+          const wsError = detectWindsurfError(accum);
+          if (wsError) {
+            controller.enqueue(
+              encoder.encode(`data: ${JSON.stringify({ error: { message: wsError.message } })}\n\n`)
+            );
+            controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+            controller.close();
+            return;
+          }
+        }
+
+        // Flush buffered first chunk
+        if (accum) {
+          const responseChunk = createOpenAICompatibleResponse(
+            responseId,
+            requestedModel,
+            accum,
+            true
+          );
+          controller.enqueue(
+            encoder.encode(`data: ${JSON.stringify(responseChunk)}\n\n`)
+          );
+        }
+        firstChunk = false;
 
         // Send final chunk with finish_reason
         const finalChunk = createOpenAICompatibleResponse(
@@ -713,6 +770,14 @@ async function ensureWindsurfProxyServer(): Promise<string> {
           }
 
           const responseData = await createNonStreamingResponse(credentials, requestBody);
+          // Detect Windsurf backend errors returned as chat content
+          const content = responseData.choices?.[0]?.message?.content;
+          if (content) {
+            const wsError = detectWindsurfError(content);
+            if (wsError) {
+              return openAIError(wsError.status, wsError.message);
+            }
+          }
           return new Response(JSON.stringify(responseData), {
             status: 200,
             headers: { 'Content-Type': 'application/json' },
