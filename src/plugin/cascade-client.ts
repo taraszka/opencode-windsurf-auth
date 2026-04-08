@@ -416,9 +416,18 @@ export async function* streamCascadeChat(
       if (/CRITICAL REQUIREMENTS|old_string|new_string|TodoWrite/i.test(candidate)) continue;
       if (/^(say |describe |explain |create |write |list |compare )/i.test(candidate) && candidate.length < 50) continue; // user prompt echo
 
+      // Clean protobuf tag artifacts: leading "z" + length byte, trailing junk
+      let cleaned = candidate
+        .replace(/^[#\/%&\*\+].?z.[\n\r]?/g, '')  // leading tag: #z!, /z-, etc
+        .replace(/^z.[\n\r]?/, '')                   // bare z + length
+        .replace(/[\n\r]?[&\*#\/%]$/g, '')           // trailing artifacts
+        .trim();
+
+      if (cleaned.length < 4) continue;
+
       // First valid text = the response (it comes before planner summary)
-      if (candidate.length > bestResponse.length) {
-        bestResponse = candidate;
+      if (cleaned.length > bestResponse.length) {
+        bestResponse = cleaned;
       }
       // Stop after finding the first substantial match
       if (bestResponse.length > 10) break;
