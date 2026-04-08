@@ -437,6 +437,32 @@ export async function* streamCascadeChat(
   }
 
   if (bestResponse) {
+    // Format Cascade tool call JSON (e.g., ask_user_question) into readable text
+    const trimmed = bestResponse.trim();
+    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (parsed.question && typeof parsed.question === 'string') {
+          let formatted = parsed.question;
+          if (Array.isArray(parsed.options)) {
+            formatted += '\n\n';
+            for (const opt of parsed.options) {
+              if (opt.label) {
+                formatted += `- **${opt.label}**`;
+                if (opt.description) formatted += `: ${opt.description}`;
+                formatted += '\n';
+              }
+            }
+          }
+          yield formatted;
+          return;
+        }
+        if (parsed.action === 'final' && parsed.content) {
+          yield parsed.content;
+          return;
+        }
+      } catch { /* not JSON, yield as-is */ }
+    }
     yield bestResponse;
   }
 }
