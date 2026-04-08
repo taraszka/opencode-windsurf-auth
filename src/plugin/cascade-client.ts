@@ -458,19 +458,36 @@ export async function* streamCascadeChat(
 
   try { streamReq.destroy(); } catch {}
 
-  // Extract the response text from the last few frames using f15 field extraction.
-  // The assistant's text is always in protobuf field 15 at deep nesting.
-  // We only look at the last 5 frames to avoid config/system prompt noise.
-  const lastN = Math.min(5, frameQueue.length);
-  let bestResponse = '';
+  // Extract the response text from frames using f15 field extraction.
+  // Strategy: collect ALL f15 strings from the second half of frames,
+  // filter out planner summaries, pick the longest remaining.
+  const halfStart = Math.max(0, Math.floor(frameQueue.length / 2));
+  const candidates: string[] = [];
 
-  for (let i = frameQueue.length - lastN; i < frameQueue.length; i++) {
+  for (let i = halfStart; i < frameQueue.length; i++) {
     const f15s = extractF15Strings(frameQueue[i]);
-    for (const s of f15s) {
-      if (s.length > bestResponse.length) {
-        bestResponse = s;
-      }
-    }
+    candidates.push(...f15s);
+  }
+
+  // Filter out planner/brain summaries (internal Cascade thinking, not user-facing)
+  const PLANNER_PATTERNS = [
+    /main objective/i,
+    /current goal is to/i,
+    /I (?:need to|have to|will|should|must) (?:wait|analyze|understand|explore|look|read|check|find|search|provide|summarize)/i,
+    /^(?:Initial Greeting|Repository Overview|Code Analysis|Task Analysis|User Request)/,
+    /await further instructions/i,
+  ];
+
+  let bestResponse = '';
+  for (const s of candidates) {
+    if (s.length <= bestResponse.length) continue;
+    if (PLANNER_PATTERNS.some(p => p.test(s))) continue;
+    bestResponse = s;
+  }
+
+  // If everything was filtered (only planner text), fall back to longest candidate
+  if (!bestResponse && candidates.length > 0) {
+    bestResponse = candidates.reduce((a, b) => a.length >= b.length ? a : b, '');
   }
 
   if (bestResponse) {
