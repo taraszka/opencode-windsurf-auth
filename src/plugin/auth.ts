@@ -239,7 +239,7 @@ export function getPort(): number {
   if (process.platform !== 'win32' && pid) {
     try {
       const lsof = execSync(
-        `lsof -p ${pid} -i -P -n 2>/dev/null | grep LISTEN`,
+        `lsof -p ${pid} -i -P -n 2>/dev/null | grep LISTEN | grep language_`,
         { encoding: 'utf8', timeout: 15000 }
       );
       
