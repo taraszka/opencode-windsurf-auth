@@ -376,7 +376,17 @@ function normalizeToolArguments(raw: any): any {
     }
     const result: Record<string, any> = {};
     for (const [key, value] of Object.entries(raw)) {
-      result[key] = normalizeToolArguments(value);
+      const normalized = normalizeToolArguments(value);
+      // Keys that should be strings but the model sends as objects — stringify them.
+      // Common in file write tools: content, new_string, old_string, etc.
+      if (typeof normalized === 'object' && normalized !== null && !Array.isArray(normalized)) {
+        const stringKeys = ['content', 'new_string', 'old_string', 'file_content', 'body', 'text', 'code'];
+        if (stringKeys.includes(key)) {
+          result[key] = JSON.stringify(normalized, null, 2);
+          continue;
+        }
+      }
+      result[key] = normalized;
     }
     return result;
   }
