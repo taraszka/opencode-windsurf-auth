@@ -185,102 +185,60 @@ function buildStreamReactiveUpdatesRequest(cascadeId: string): Buffer {
 }
 
 // ============================================================================
-// Response Parsing
+// Response Extraction
 // ============================================================================
 
-function decodeVarintFromBuf(buffer: Buffer, offset: number): [bigint, number] {
-  let result = 0n;
-  let shift = 0n;
-  let bytesRead = 0;
-  while (offset + bytesRead < buffer.length) {
-    const byte = buffer[offset + bytesRead];
-    bytesRead++;
-    result |= BigInt(byte & 0x7f) << shift;
-    if ((byte & 0x80) === 0) break;
-    shift += 7n;
-  }
-  return [result, bytesRead];
-}
+/** Metadata/noise patterns to exclude from extracted text */
+const NOISE_PATTERNS = [
+  /^file:\/\//,
+  /^ssh:\/\//,
+  /^\/Applications\//,
+  /^\/Users\//,
+  /^\{"file_path"/,
+  /^\{"DirectoryPath"/,
+  /^\{"command"/,
+  /^Credits spent/,
+  /^trafficType$/,
+  /^Response Statistics$/,
+  /^ON_DEMAND$/,
+  /^responseId$/,
+  /^MODEL_/,
+  /^claude-opus/,
+  /^claude-sonnet/,
+  /^windsurf$/,
+  /^[a-f0-9-]{36}$/,
+];
 
 /**
- * Parse protobuf fields from a buffer.
- * Returns array of {fieldNum, wireType, data/value}.
+ * Extract the longest natural-language text from a raw protobuf frame.
+ *
+ * Instead of navigating protobuf field paths (which is fragile due to
+ * nested tool calls and metadata at the same field numbers), we scan
+ * for the longest contiguous printable substring containing spaces.
+ * The assistant's text response is always the longest such string.
  */
-function parseProtoFields(buffer: Buffer): Array<{
-  fieldNum: number;
-  wireType: number;
-  data?: Buffer;
-  value?: bigint;
-}> {
-  const fields: Array<{ fieldNum: number; wireType: number; data?: Buffer; value?: bigint }> = [];
-  let offset = 0;
-  while (offset < buffer.length) {
-    const [tag, tagBytes] = decodeVarintFromBuf(buffer, offset);
-    const fieldNum = Number(tag >> 3n);
-    const wireType = Number(tag & 0x7n);
-    offset += tagBytes;
-    if (wireType === 0) {
-      const [val, valBytes] = decodeVarintFromBuf(buffer, offset);
-      offset += valBytes;
-      fields.push({ fieldNum, wireType, value: val });
-    } else if (wireType === 2) {
-      const [len, lenBytes] = decodeVarintFromBuf(buffer, offset);
-      offset += lenBytes;
-      const l = Number(len);
-      if (offset + l > buffer.length) break;
-      fields.push({ fieldNum, wireType, data: buffer.subarray(offset, offset + l) });
-      offset += l;
-    } else if (wireType === 5) {
-      offset += 4;
-    } else if (wireType === 1) {
-      offset += 8;
-    } else {
-      break;
-    }
-  }
-  return fields;
-}
+function extractLongestNaturalText(buffer: Buffer): string {
+  const str = buffer.toString('utf8');
+  // Find all runs of printable characters (including newlines) ≥ 20 chars
+  const matches = [...str.matchAll(/[\x20-\x7e\n\r\t]{20,}/g)];
 
-/**
- * Extract ALL f15 printable strings from a protobuf buffer (no bot-marker filter).
- * Used for response frames after the bot marker has been seen.
- */
-function extractAllF15Strings(buffer: Buffer): string[] {
-  const texts: string[] = [];
-  function walk(buf: Buffer): void {
-    const fields = parseProtoFields(buf);
-    for (const f of fields) {
-      if (f.wireType !== 2 || !f.data) continue;
-      const str = f.data.toString('utf8');
-      const isPrintable = f.data.length > 0 && /^[\x20-\x7e\n\r\t\u00a0-\uffff]+$/.test(str);
-      if (f.fieldNum === 15 && isPrintable && f.data.length > 1) {
-        // Filter metadata noise (same filters as extractContentFromReactiveUpdate)
-        if (
-          !/^[a-f0-9-]{10,}$/.test(str) &&
-          !/^MODEL_/.test(str) &&
-          !/^claude-/.test(str) &&
-          !/^\//.test(str) &&
-          !/^windsurf$/i.test(str) &&
-          !/^bot-/.test(str) &&
-          !/^z[\$a-f0-9]/.test(str) &&
-          !/^[a-zA-Z0-9_]{20,}$/.test(str) &&
-          !/^(Response Statistics|Credits spent|credits?|model|Model| credits?|yaml|trafficType)$/i.test(str) &&
-          !/^Claude (Opus|Sonnet|Haiku|Code)/.test(str)
-        ) {
-          texts.push(str);
-        }
-      } else if (!isPrintable && f.data.length > 2) {
-        walk(f.data);
-      }
-    }
+  let best = '';
+  for (const m of matches) {
+    const candidate = m[0];
+    // Must contain spaces (natural language, not identifiers)
+    if (!candidate.includes(' ')) continue;
+    if (candidate.length <= best.length) continue;
+    // Skip metadata noise
+    if (NOISE_PATTERNS.some(p => p.test(candidate))) continue;
+    best = candidate;
   }
-  walk(buffer);
-  const seen = new Set<string>();
-  return texts.filter(t => {
-    if (seen.has(t)) return false;
-    seen.add(t);
-    return true;
-  });
+
+  // Clean up: remove leading protobuf tag bytes (e.g., "z8\n" prefix)
+  best = best.replace(/^z.\n?/, '').replace(/^z.\r?\n?/, '').trim();
+  // Remove trailing protobuf artifacts
+  best = best.replace(/\n?\*?\s*$/, '').trim();
+
+  return best;
 }
 
 // ============================================================================
@@ -332,10 +290,24 @@ export async function* streamCascadeChat(
       WindsurfErrorCode.CONNECTION_FAILED
     );
   }
+  // Extract cascade_id (field 1 string) from StartCascadeResponse
   const serverCascadeId = (() => {
-    const fields = parseProtoFields(startResult.data);
-    const f1 = fields.find(f => f.fieldNum === 1 && f.data);
-    return f1?.data?.toString('utf8') || cascadeId;
+    const data = startResult.data;
+    if (data.length < 3) return cascadeId;
+    // Field 1, wire type 2: tag byte = 0x0a, then varint length, then string
+    if (data[0] === 0x0a) {
+      let len = 0, shift = 0, off = 1;
+      while (off < data.length) {
+        const b = data[off++];
+        len |= (b & 0x7f) << shift;
+        if (!(b & 0x80)) break;
+        shift += 7;
+      }
+      if (off + len <= data.length) {
+        return data.subarray(off, off + len).toString('utf8');
+      }
+    }
+    return cascadeId;
   })();
 
   // Step 2: Open streaming connection (envelope-framed Connect protocol)
@@ -344,10 +316,12 @@ export async function* streamCascadeChat(
   streamEnvelope.writeUInt32BE(streamProto.length, 1);
   streamProto.copy(streamEnvelope, 5);
 
-  // Step 2b: Set up frame queue for incremental processing
+  // Step 2b: Set up frame queue and idle-based completion
   const frameQueue: Buffer[] = [];
   let streamDone = false;
   let resolveWait: (() => void) | null = null;
+  let messageSent = false;
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
 
   const streamReq = http.request(
     {
@@ -374,6 +348,11 @@ export async function* streamCascadeChat(
             frameQueue.push(chunk.subarray(off, off + len));
           }
           off += len;
+        }
+        // Reset idle timer — settle 5s after last frame
+        if (messageSent) {
+          if (idleTimer) clearTimeout(idleTimer);
+          idleTimer = setTimeout(() => { streamDone = true; resolveWait?.(); }, 5000);
         }
         resolveWait?.();
       });
@@ -409,26 +388,22 @@ export async function* streamCascadeChat(
     );
   }
 
-  // Step 4: Wait for completion, then extract the final response.
-  // Cascade agents use tools (file reads, searches) which produce noise in f15 fields.
-  // We wait for "Response Statistics" or timeout, then pick the longest
-  // natural-language string as the response.
+  // Signal message sent — start idle timer
+  messageSent = true;
+  idleTimer = setTimeout(() => { streamDone = true; resolveWait?.(); }, 5000);
+
+  // Step 4: Wait for frames to settle (5s idle after last frame), then extract.
+  // The Cascade stream never ends naturally — it's long-lived.
+  // Frames arrive in bursts during each agent turn. A 5s gap after
+  // the last frame reliably indicates the agent has finished.
   while (!streamDone) {
     await new Promise<void>((r) => { resolveWait = r; });
     resolveWait = null;
-
-    // Check for completion signal
-    for (let i = frameQueue.length - 1; i >= Math.max(0, frameQueue.length - 3); i--) {
-      if (frameQueue[i]?.toString('utf8').includes('Response Statistics')) {
-        streamDone = true;
-        break;
-      }
-    }
   }
 
   try { streamReq.destroy(); } catch {}
 
-  // Find the longest natural-language f15 string across all post-user frames
+  // Extract the longest natural-language text across all post-user frames
   let userSeen = false;
   let bestResponse = '';
 
@@ -440,14 +415,10 @@ export async function* streamCascadeChat(
       }
       continue;
     }
-    if (frameStr.includes('Response Statistics')) break;
 
-    const texts = extractAllF15Strings(frame);
-    for (const t of texts) {
-      // Must contain a space (natural language, not tool_name or file.path)
-      if (t.length > bestResponse.length && t.includes(' ')) {
-        bestResponse = t;
-      }
+    const text = extractLongestNaturalText(frame);
+    if (text.length > bestResponse.length) {
+      bestResponse = text;
     }
   }
 
