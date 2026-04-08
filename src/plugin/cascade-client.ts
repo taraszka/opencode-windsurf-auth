@@ -235,6 +235,21 @@ function extractF15Strings(buffer: Buffer): string[] {
           !/^[a-zA-Z0-9_]{20,}$/.test(str) &&
           !/^(Response Statistics|Credits spent|credits?|model|Model| credits?|yaml|trafficType)$/i.test(str) &&
           !/^Claude (Opus|Sonnet|Haiku|Code)/.test(str) &&
+          // Filter Cascade internal tool definitions and system config
+          !str.includes('CRITICAL REQUIREMENTS:') &&
+          !str.includes('old_string') &&
+          !str.includes('new_string') &&
+          !str.includes('replace_all') &&
+          !str.includes('This is a tool for') &&
+          !str.includes('Before using this tool') &&
+          !str.includes('file_path:') &&
+          !str.includes('<communication_style>') &&
+          !str.includes('<tool_calling>') &&
+          !str.includes('<making_code_changes>') &&
+          !str.includes('<workspace_layout') &&
+          !str.includes('You are Cascade') &&
+          !str.includes('You are OpenCode') &&
+          !str.includes('TodoWrite') &&
           str.includes(' ')
         ) {
           results.push(str);
