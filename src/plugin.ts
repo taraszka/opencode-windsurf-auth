@@ -72,13 +72,29 @@ async function runWindsurfOnce(
 ): Promise<string> {
   const chunks: string[] = [];
   const resolved = resolveModel(model);
-  const generator = requiresCascadeProtocol(resolved.enumValue)
-    ? streamCascadeChat(credentials, { model: resolved.modelId, messages: [{ role: 'user', content: prompt }] })
-    : streamChatGenerator(credentials, { model, messages: [{ role: 'user', content: prompt }] });
-  for await (const chunk of generator) {
+  const messages = [{ role: 'user' as const, content: prompt }];
+
+  let gen: AsyncGenerator<string, void, unknown> = requiresCascadeProtocol(resolved.enumValue)
+    ? streamCascadeChat(credentials, { model: resolved.modelId, messages })
+    : streamChatGenerator(credentials, { model, messages });
+
+  for await (const chunk of gen) {
     chunks.push(chunk);
   }
-  return chunks.join('');
+
+  const result = chunks.join('');
+
+  // If gRPC failed with "failed_precondition" (Free plan), retry via Cascade
+  if (result.includes('failed_precondition') && !requiresCascadeProtocol(resolved.enumValue)) {
+    const cascadeChunks: string[] = [];
+    const cascadeGen = streamCascadeChat(credentials, { model: resolved.modelId, messages });
+    for await (const chunk of cascadeGen) {
+      cascadeChunks.push(chunk);
+    }
+    return cascadeChunks.join('');
+  }
+
+  return result;
 }
 
 async function planToolCall(
