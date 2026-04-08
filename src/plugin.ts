@@ -742,8 +742,14 @@ async function ensureWindsurfProxyServer(): Promise<string> {
               (m.role === 'assistant' && Array.isArray((m as any).tool_calls) && (m as any).tool_calls.length > 0)
           );
 
-          // If tools are requested, run local planning loop (non-streaming only).
-          if (hasToolsField || hasToolMessages) {
+          // For Cascade models (enum-less like Claude 4.6), skip tool planning —
+          // Cascade has its own native tool system. The tool-planning prompt
+          // wrapping would leak OpenCode internals into the response.
+          const resolved = resolveModel(requestBody.model || getDefaultModel());
+          const isCascadeModel = requiresCascadeProtocol(resolved.enumValue);
+
+          // If tools are requested and NOT a Cascade model, run local planning loop.
+          if ((hasToolsField || hasToolMessages) && !isCascadeModel) {
             if (isStreaming) {
               const stream = handleToolPlanningStream(credentials, requestBody);
               return new Response(stream, {
