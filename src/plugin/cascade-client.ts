@@ -209,6 +209,23 @@ const NOISE_PATTERNS = [
   /^[a-f0-9-]{36}$/,
 ];
 
+/** Patterns that indicate Cascade system prompt / internal config (not user content) */
+const SYSTEM_PROMPT_MARKERS = [
+  '<communication_style>',
+  '<tool_calling>',
+  '<making_code_changes>',
+  '<workspace_information>',
+  '<workspace_layout',
+  '<memory_system>',
+  '<user_information>',
+  '<ide_metadata>',
+  'You are Cascade, a powerful agentic AI',
+  'STRICT OUTPUT:',
+  'RESPONSE FORMAT:',
+  '<existing_code>',
+  '<citation_guidelines>',
+];
+
 /**
  * Extract the longest natural-language text from a raw protobuf frame.
  *
@@ -230,6 +247,8 @@ function extractLongestNaturalText(buffer: Buffer): string {
     if (candidate.length <= best.length) continue;
     // Skip metadata noise
     if (NOISE_PATTERNS.some(p => p.test(candidate))) continue;
+    // Skip Cascade system prompt / internal config
+    if (SYSTEM_PROMPT_MARKERS.some(m => candidate.includes(m))) continue;
     best = candidate;
   }
 
