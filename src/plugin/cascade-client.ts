@@ -421,20 +421,15 @@ export async function* streamCascadeChat(
 
   try { streamReq.destroy(); } catch {}
 
-  // Extract the longest natural-language text across all post-user frames
-  let userSeen = false;
+  // Extract text from the LAST few frames only.
+  // The Cascade stream structure: config frames → user echo → tool calls → response.
+  // The actual assistant response is always in the last frames before the stream settles.
+  // Early frames contain system prompts, tool definitions, and config — skip them all.
+  const lastN = Math.min(5, frameQueue.length);
   let bestResponse = '';
 
-  for (const frame of frameQueue) {
-    const frameStr = frame.toString('utf8');
-    if (!userSeen) {
-      if (frameStr.includes(userMessage.substring(0, Math.min(20, userMessage.length)))) {
-        userSeen = true;
-      }
-      continue;
-    }
-
-    const text = extractLongestNaturalText(frame);
+  for (let i = frameQueue.length - lastN; i < frameQueue.length; i++) {
+    const text = extractLongestNaturalText(frameQueue[i]);
     if (text.length > bestResponse.length) {
       bestResponse = text;
     }
