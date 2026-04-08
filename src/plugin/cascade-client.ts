@@ -368,7 +368,7 @@ export async function* streamCascadeChat(
         // Reset idle timer — settle 5s after last frame
         if (messageSent) {
           if (idleTimer) clearTimeout(idleTimer);
-          idleTimer = setTimeout(() => { streamDone = true; resolveWait?.(); }, 5000);
+          idleTimer = setTimeout(() => { streamDone = true; resolveWait?.(); }, 20000);
         }
         resolveWait?.();
       });
