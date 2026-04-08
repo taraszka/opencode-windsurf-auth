@@ -251,6 +251,13 @@ function extractF15Strings(buffer: Buffer): string[] {
 }
 
 // ============================================================================
+// Session Management
+// ============================================================================
+
+/** Cache cascade_id per model for multi-turn conversations. */
+const cascadeSessionCache = new Map<string, string>();
+
+// ============================================================================
 // Public API
 // ============================================================================
 
@@ -271,52 +278,53 @@ export async function* streamCascadeChat(
   options: { model: string; messages: CascadeChatMessage[] }
 ): AsyncGenerator<string, void, unknown> {
   const { csrfToken, port, apiKey, version } = credentials;
-  const cascadeId = crypto.randomUUID();
   const modelUid = options.model; // Already the server model UID (e.g., "claude-opus-4-6")
 
-  // Only send user messages — Cascade has its own system prompt.
-  // Sending OpenCode's system prompt would leak it into the response.
-  const parts: string[] = [];
-  for (const msg of options.messages) {
-    if (msg.role === 'user') {
-      parts.push(msg.content);
-    }
-  }
-  const userMessage = parts.join('\n\n');
+  // Only send the LAST user message — Cascade maintains history server-side.
+  // Sending all messages would duplicate context the server already has.
+  const userMessages = options.messages.filter(m => m.role === 'user');
+  const userMessage = userMessages.length > 0
+    ? userMessages[userMessages.length - 1].content
+    : '';
 
-  // Step 1: StartCascade to get a server-registered cascade_id
-  const startBody = Buffer.from(encodeMessage(1, buildMetadata(apiKey, version)));
-  const startResult = await connectPost(
-    port,
-    '/exa.language_server_pb.LanguageServerService/StartCascade',
-    csrfToken,
-    startBody
-  );
-  if (startResult.status !== 200) {
-    throw new WindsurfError(
-      `StartCascade failed: ${startResult.data.toString('utf8')}`,
-      WindsurfErrorCode.CONNECTION_FAILED
+  // Step 1: Reuse existing cascade session or start a new one.
+  // This enables multi-turn conversations within the same model.
+  let serverCascadeId = cascadeSessionCache.get(modelUid);
+
+  if (!serverCascadeId) {
+    const startBody = Buffer.from(encodeMessage(1, buildMetadata(apiKey, version)));
+    const startResult = await connectPost(
+      port,
+      '/exa.language_server_pb.LanguageServerService/StartCascade',
+      csrfToken,
+      startBody
     );
-  }
-  // Extract cascade_id (field 1 string) from StartCascadeResponse
-  const serverCascadeId = (() => {
-    const data = startResult.data;
-    if (data.length < 3) return cascadeId;
-    // Field 1, wire type 2: tag byte = 0x0a, then varint length, then string
-    if (data[0] === 0x0a) {
-      let len = 0, shift = 0, off = 1;
-      while (off < data.length) {
-        const b = data[off++];
-        len |= (b & 0x7f) << shift;
-        if (!(b & 0x80)) break;
-        shift += 7;
-      }
-      if (off + len <= data.length) {
-        return data.subarray(off, off + len).toString('utf8');
-      }
+    if (startResult.status !== 200) {
+      throw new WindsurfError(
+        `StartCascade failed: ${startResult.data.toString('utf8')}`,
+        WindsurfErrorCode.CONNECTION_FAILED
+      );
     }
-    return cascadeId;
-  })();
+    // Extract cascade_id (field 1 string) from StartCascadeResponse
+    serverCascadeId = (() => {
+      const data = startResult.data;
+      if (data.length < 3) return crypto.randomUUID();
+      if (data[0] === 0x0a) {
+        let len = 0, shift = 0, off = 1;
+        while (off < data.length) {
+          const b = data[off++];
+          len |= (b & 0x7f) << shift;
+          if (!(b & 0x80)) break;
+          shift += 7;
+        }
+        if (off + len <= data.length) {
+          return data.subarray(off, off + len).toString('utf8');
+        }
+      }
+      return crypto.randomUUID();
+    })();
+    cascadeSessionCache.set(modelUid, serverCascadeId);
+  }
 
   // Step 2: Open streaming connection (envelope-framed Connect protocol)
   const streamProto = buildStreamReactiveUpdatesRequest(serverCascadeId);
@@ -390,6 +398,8 @@ export async function* streamCascadeChat(
     sendBody
   );
   if (sendResult.status !== 200) {
+    // If the session is stale, clear cache and let the next request create a fresh one
+    cascadeSessionCache.delete(modelUid);
     throw new WindsurfError(
       `SendUserCascadeMessage failed: ${sendResult.data.toString('utf8')}`,
       WindsurfErrorCode.STREAM_ERROR
