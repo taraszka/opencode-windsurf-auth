@@ -537,17 +537,31 @@ function createStreamingResponse(
                 : m.content.map((p) => p.text || '').join(''),
           }));
 
-        // Route: Cascade protocol for enum-less models, gRPC for the rest
-        const generator = requiresCascadeProtocol(resolved.enumValue)
-          ? streamCascadeChat(credentials, { model: effectiveModel, messages })
-          : streamChatGenerator(credentials, { model: effectiveModel, messages });
+        // Route: Cascade protocol for enum-less models, gRPC for the rest.
+        // If gRPC fails with "failed_precondition" (Free plan), fall back to Cascade.
+        let generator: AsyncGenerator<string, void, unknown>;
+        if (requiresCascadeProtocol(resolved.enumValue)) {
+          generator = streamCascadeChat(credentials, { model: effectiveModel, messages });
+        } else {
+          generator = streamChatGenerator(credentials, { model: effectiveModel, messages });
+        }
 
         let firstChunk = true;
         let accum = '';
         for await (const chunk of generator) {
-          // Buffer initial content to detect single-chunk error responses
           if (firstChunk) {
             accum += chunk;
+            // Detect gRPC "failed_precondition" and retry via Cascade
+            if (accum.includes('failed_precondition')) {
+              accum = '';
+              generator = streamCascadeChat(credentials, { model: effectiveModel, messages });
+              for await (const cascadeChunk of generator) {
+                if (firstChunk) { accum += cascadeChunk; firstChunk = false; continue; }
+                const rc = createOpenAICompatibleResponse(responseId, requestedModel, cascadeChunk, true);
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify(rc)}\n\n`));
+              }
+              break;
+            }
             continue;
           }
           const responseChunk = createOpenAICompatibleResponse(
