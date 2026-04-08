@@ -361,11 +361,19 @@ function normalizeToolArguments(raw: any): any {
     return raw;
   }
 
+  // Flatten content arrays [{type:"text",text:"..."}] to plain strings
   if (Array.isArray(raw)) {
+    if (raw.every((item: any) => item && typeof item === 'object' && item.type === 'text' && typeof item.text === 'string')) {
+      return raw.map((item: any) => item.text).join('');
+    }
     return raw.map((item) => normalizeToolArguments(item));
   }
 
   if (typeof raw === 'object') {
+    // Flatten {type:"text",text:"..."} to plain string
+    if (raw.type === 'text' && typeof raw.text === 'string' && Object.keys(raw).length <= 2) {
+      return raw.text;
+    }
     const result: Record<string, any> = {};
     for (const [key, value] of Object.entries(raw)) {
       result[key] = normalizeToolArguments(value);
