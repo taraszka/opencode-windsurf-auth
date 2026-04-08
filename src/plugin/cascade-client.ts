@@ -211,82 +211,6 @@ function buildStreamReactiveUpdatesRequest(cascadeId: string): Buffer {
 // ============================================================================
 
 
-/**
- * Decode a varint from buffer at offset.
- */
-function decodeVarInt(buf: Buffer, off: number): [bigint, number] {
-  let r = 0n, s = 0n, n = 0;
-  while (off + n < buf.length) {
-    const b = buf[off + n]; n++;
-    r |= BigInt(b & 0x7f) << s;
-    if (!(b & 0x80)) break;
-    s += 7n;
-  }
-  return [r, n];
-}
-
-/**
- * Recursively extract all field-15 printable strings from a protobuf buffer.
- * Field 15 at deep nesting is where the Cascade reactive system stores
- * the assistant's text content. Other data (tool calls, stack traces,
- * system prompts) use different field numbers.
- */
-function extractF15Strings(buffer: Buffer): string[] {
-  const results: string[] = [];
-  let off = 0;
-  while (off < buffer.length) {
-    const [tag, tb] = decodeVarInt(buffer, off);
-    const fn = Number(tag >> 3n), wt = Number(tag & 0x7n);
-    off += tb;
-    if (wt === 0) {
-      const [, vb] = decodeVarInt(buffer, off); off += vb;
-    } else if (wt === 2) {
-      const [len, lb] = decodeVarInt(buffer, off); off += lb;
-      const l = Number(len);
-      if (off + l > buffer.length) break;
-      const data = buffer.subarray(off, off + l);
-      const str = data.toString('utf8');
-      const printable = l > 0 && /^[\x20-\x7e\n\r\t\u00a0-\uffff]+$/.test(str);
-      if (fn === 15 && printable && l > 3) {
-        // Filter out metadata at f15
-        if (
-          !/^[a-f0-9-]{10,}$/.test(str) &&
-          !/^MODEL_/.test(str) &&
-          !/^claude-/.test(str) &&
-          !/^windsurf$/i.test(str) &&
-          !/^[a-zA-Z0-9_]{20,}$/.test(str) &&
-          !/^(Response Statistics|Credits spent|credits?|model|Model| credits?|yaml|trafficType)$/i.test(str) &&
-          !/^Claude (Opus|Sonnet|Haiku|Code)/.test(str) &&
-          // Filter Cascade internal tool definitions and system config
-          !str.includes('CRITICAL REQUIREMENTS:') &&
-          !str.includes('old_string') &&
-          !str.includes('new_string') &&
-          !str.includes('replace_all') &&
-          !str.includes('This is a tool for') &&
-          !str.includes('Before using this tool') &&
-          !str.includes('file_path:') &&
-          !str.includes('<communication_style>') &&
-          !str.includes('<tool_calling>') &&
-          !str.includes('<making_code_changes>') &&
-          !str.includes('<workspace_layout') &&
-          !str.includes('You are Cascade') &&
-          !str.includes('You are OpenCode') &&
-          !str.includes('TodoWrite') &&
-          str.includes(' ')
-        ) {
-          results.push(str);
-        }
-      } else if (!printable && l > 2) {
-        results.push(...extractF15Strings(data));
-      }
-      off += l;
-    } else if (wt === 5) off += 4;
-    else if (wt === 1) off += 8;
-    else break;
-  }
-  return results;
-}
-
 // ============================================================================
 // Session Management
 // ============================================================================
@@ -458,44 +382,48 @@ export async function* streamCascadeChat(
 
   try { streamReq.destroy(); } catch {}
 
-  // Extract the response text from frames using f15 field extraction.
-  // Strategy: collect ALL f15 strings from the second half of frames,
-  // filter out planner summaries, pick the longest remaining.
-  const halfStart = Math.max(0, Math.floor(frameQueue.length / 2));
-  const candidates: string[] = [];
-
-  for (let i = halfStart; i < frameQueue.length; i++) {
-    const f15s = extractF15Strings(frameQueue[i]);
-    candidates.push(...f15s);
-  }
-
-  // Filter out planner summaries and system config leaked into f15
-  const PLANNER_PATTERNS = [
-    /main objective/i,
-    /current goal is to/i,
-    /I (?:need to|have to|will|should|must) (?:wait|analyze|understand|explore|look|read|check|find|search|provide|summarize)/i,
-    /^(?:Initial Greeting|Repository Overview|Code Analysis|Task Analysis|User Request)/,
-    /await further instructions/i,
-    // Cascade/OpenCode system prompts and config
-    /<\w+_\w+>/,  // XML-like tags: <markdown_formatting>, <tool_calling>, etc.
-    /Be terse and direct/,
-    /You are (?:Cascade|OpenCode)/,
-    /TodoWrite/,
-    /acknowledgment phrases/i,
-    /CRITICAL REQUIREMENTS/,
-    /old_string.*new_string/s,
-  ];
-
+  // Extract response: scan ALL frames for the FIRST printable text with spaces
+  // that appears AFTER the user message frame. The actual response comes early
+  // in the stream; planner summaries come late. Skip known noise patterns.
+  let userSeen = false;
   let bestResponse = '';
-  for (const s of candidates) {
-    if (s.length <= bestResponse.length) continue;
-    if (PLANNER_PATTERNS.some(p => p.test(s))) continue;
-    bestResponse = s;
-  }
 
-  // If everything was filtered (only planner text), fall back to longest candidate
-  if (!bestResponse && candidates.length > 0) {
-    bestResponse = candidates.reduce((a, b) => a.length >= b.length ? a : b, '');
+  for (const frame of frameQueue) {
+    const text = frame.toString('utf8');
+
+    // Skip until we see user message echoed back
+    if (!userSeen) {
+      if (text.includes(userMessage.substring(0, Math.min(15, userMessage.length)))) {
+        userSeen = true;
+      }
+      continue;
+    }
+
+    // Scan for printable text runs with spaces
+    const matches = [...text.matchAll(/[\x20-\x7e\n\r\t]{5,}/g)];
+    for (const m of matches) {
+      const candidate = m[0].trim();
+      if (!candidate.includes(' ')) continue;
+      if (candidate.length <= 3) continue;
+
+      // Skip noise
+      if (/^[a-f0-9-]{10,}$/.test(candidate)) continue;
+      if (/Response Statistics|Input tokens|Output tokens|Token Usage|Cached input|Credits spent/i.test(candidate)) continue;
+      if (/Claude (Opus|Sonnet)|^MODEL_|^windsurf$/i.test(candidate)) continue;
+      if (/<\w+_\w+>/.test(candidate)) continue;
+      if (/main objective|user'?s .*(objective|goal|request)|await further|was completed in the previou/i.test(candidate)) continue;
+      if (/You are (Cascade|OpenCode)/i.test(candidate)) continue;
+      if (/CRITICAL REQUIREMENTS|old_string|new_string|TodoWrite/i.test(candidate)) continue;
+      if (/^(say |describe |explain |create |write |list |compare )/i.test(candidate) && candidate.length < 50) continue; // user prompt echo
+
+      // First valid text = the response (it comes before planner summary)
+      if (candidate.length > bestResponse.length) {
+        bestResponse = candidate;
+      }
+      // Stop after finding the first substantial match
+      if (bestResponse.length > 10) break;
+    }
+    if (bestResponse.length > 10) break;
   }
 
   if (bestResponse) {
