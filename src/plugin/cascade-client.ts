@@ -87,6 +87,28 @@ function connectPost(
 }
 
 // ============================================================================
+// Model UID Resolution for Cascade
+// ============================================================================
+
+import { ModelEnum } from './types.js';
+
+/** Reverse map: enum value → enum name (e.g., 359 → "MODEL_SWE_1_5") */
+const ENUM_VALUE_TO_NAME: Record<number, string> = {};
+for (const [name, value] of Object.entries(ModelEnum)) {
+  ENUM_VALUE_TO_NAME[value as number] = 'MODEL_' + name;
+}
+
+/**
+ * Resolve the Cascade model UID for a given model.
+ * - Enum-less models (4.6): use the server UID directly (e.g., "claude-opus-4-6")
+ * - Enum-based models (fallback): use the enum NAME (e.g., "MODEL_SWE_1_5")
+ */
+export function getCascadeModelUid(modelId: string, enumValue: number): string {
+  if (enumValue === 0) return modelId; // Already a server UID
+  return ENUM_VALUE_TO_NAME[enumValue] || modelId;
+}
+
+// ============================================================================
 // Request Building
 // ============================================================================
 

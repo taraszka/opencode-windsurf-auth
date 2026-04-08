@@ -18,7 +18,7 @@ import * as crypto from 'crypto';
 import type { PluginInput, Hooks } from '@opencode-ai/plugin';
 import { getCredentials, isWindsurfRunning, WindsurfCredentials } from './plugin/auth.js';
 import { streamChatGenerator, ChatMessage } from './plugin/grpc-client.js';
-import { streamCascadeChat, requiresCascadeProtocol } from './plugin/cascade-client.js';
+import { streamCascadeChat, requiresCascadeProtocol, getCascadeModelUid } from './plugin/cascade-client.js';
 import {
   getDefaultModel,
   getCanonicalModels,
@@ -86,8 +86,9 @@ async function runWindsurfOnce(
 
   // If gRPC failed with "failed_precondition" (Free plan), retry via Cascade
   if (result.includes('failed_precondition') && !requiresCascadeProtocol(resolved.enumValue)) {
+    const cascadeUid = getCascadeModelUid(resolved.modelId, resolved.enumValue);
     const cascadeChunks: string[] = [];
-    const cascadeGen = streamCascadeChat(credentials, { model: resolved.modelId, messages });
+    const cascadeGen = streamCascadeChat(credentials, { model: cascadeUid, messages });
     for await (const chunk of cascadeGen) {
       cascadeChunks.push(chunk);
     }
@@ -570,7 +571,8 @@ function createStreamingResponse(
             // Detect gRPC "failed_precondition" and retry via Cascade
             if (accum.includes('failed_precondition')) {
               accum = '';
-              generator = streamCascadeChat(credentials, { model: effectiveModel, messages });
+              const cascadeUid = getCascadeModelUid(resolved.modelId, resolved.enumValue);
+              generator = streamCascadeChat(credentials, { model: cascadeUid, messages });
               for await (const cascadeChunk of generator) {
                 if (firstChunk) { accum += cascadeChunk; firstChunk = false; continue; }
                 const rc = createOpenAICompatibleResponse(responseId, requestedModel, cascadeChunk, true);
