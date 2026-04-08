@@ -188,76 +188,66 @@ function buildStreamReactiveUpdatesRequest(cascadeId: string): Buffer {
 // Response Extraction
 // ============================================================================
 
-/** Metadata/noise patterns to exclude from extracted text */
-const NOISE_PATTERNS = [
-  /^file:\/\//,
-  /^ssh:\/\//,
-  /^\/Applications\//,
-  /^\/Users\//,
-  /^\{"file_path"/,
-  /^\{"DirectoryPath"/,
-  /^\{"command"/,
-  /^Credits spent/,
-  /^trafficType$/,
-  /^Response Statistics$/,
-  /^ON_DEMAND$/,
-  /^responseId$/,
-  /^MODEL_/,
-  /^claude-opus/,
-  /^claude-sonnet/,
-  /^windsurf$/,
-  /^[a-f0-9-]{36}$/,
-];
-
-/** Patterns that indicate Cascade system prompt / internal config (not user content) */
-const SYSTEM_PROMPT_MARKERS = [
-  '<communication_style>',
-  '<tool_calling>',
-  '<making_code_changes>',
-  '<workspace_information>',
-  '<workspace_layout',
-  '<memory_system>',
-  '<user_information>',
-  '<ide_metadata>',
-  'You are Cascade, a powerful agentic AI',
-  'STRICT OUTPUT:',
-  'RESPONSE FORMAT:',
-  '<existing_code>',
-  '<citation_guidelines>',
-];
 
 /**
- * Extract the longest natural-language text from a raw protobuf frame.
- *
- * Instead of navigating protobuf field paths (which is fragile due to
- * nested tool calls and metadata at the same field numbers), we scan
- * for the longest contiguous printable substring containing spaces.
- * The assistant's text response is always the longest such string.
+ * Decode a varint from buffer at offset.
  */
-function extractLongestNaturalText(buffer: Buffer): string {
-  const str = buffer.toString('utf8');
-  // Find all runs of printable characters (including newlines) ≥ 20 chars
-  const matches = [...str.matchAll(/[\x20-\x7e\n\r\t]{20,}/g)];
-
-  let best = '';
-  for (const m of matches) {
-    const candidate = m[0];
-    // Must contain spaces (natural language, not identifiers)
-    if (!candidate.includes(' ')) continue;
-    if (candidate.length <= best.length) continue;
-    // Skip metadata noise
-    if (NOISE_PATTERNS.some(p => p.test(candidate))) continue;
-    // Skip Cascade system prompt / internal config
-    if (SYSTEM_PROMPT_MARKERS.some(m => candidate.includes(m))) continue;
-    best = candidate;
+function decodeVarInt(buf: Buffer, off: number): [bigint, number] {
+  let r = 0n, s = 0n, n = 0;
+  while (off + n < buf.length) {
+    const b = buf[off + n]; n++;
+    r |= BigInt(b & 0x7f) << s;
+    if (!(b & 0x80)) break;
+    s += 7n;
   }
+  return [r, n];
+}
 
-  // Clean up: remove leading protobuf tag bytes (e.g., "z8\n" prefix)
-  best = best.replace(/^z.\n?/, '').replace(/^z.\r?\n?/, '').trim();
-  // Remove trailing protobuf artifacts
-  best = best.replace(/\n?\*?\s*$/, '').trim();
-
-  return best;
+/**
+ * Recursively extract all field-15 printable strings from a protobuf buffer.
+ * Field 15 at deep nesting is where the Cascade reactive system stores
+ * the assistant's text content. Other data (tool calls, stack traces,
+ * system prompts) use different field numbers.
+ */
+function extractF15Strings(buffer: Buffer): string[] {
+  const results: string[] = [];
+  let off = 0;
+  while (off < buffer.length) {
+    const [tag, tb] = decodeVarInt(buffer, off);
+    const fn = Number(tag >> 3n), wt = Number(tag & 0x7n);
+    off += tb;
+    if (wt === 0) {
+      const [, vb] = decodeVarInt(buffer, off); off += vb;
+    } else if (wt === 2) {
+      const [len, lb] = decodeVarInt(buffer, off); off += lb;
+      const l = Number(len);
+      if (off + l > buffer.length) break;
+      const data = buffer.subarray(off, off + l);
+      const str = data.toString('utf8');
+      const printable = l > 0 && /^[\x20-\x7e\n\r\t\u00a0-\uffff]+$/.test(str);
+      if (fn === 15 && printable && l > 3) {
+        // Filter out metadata at f15
+        if (
+          !/^[a-f0-9-]{10,}$/.test(str) &&
+          !/^MODEL_/.test(str) &&
+          !/^claude-/.test(str) &&
+          !/^windsurf$/i.test(str) &&
+          !/^[a-zA-Z0-9_]{20,}$/.test(str) &&
+          !/^(Response Statistics|Credits spent|credits?|model|Model| credits?|yaml|trafficType)$/i.test(str) &&
+          !/^Claude (Opus|Sonnet|Haiku|Code)/.test(str) &&
+          str.includes(' ')
+        ) {
+          results.push(str);
+        }
+      } else if (!printable && l > 2) {
+        results.push(...extractF15Strings(data));
+      }
+      off += l;
+    } else if (wt === 5) off += 4;
+    else if (wt === 1) off += 8;
+    else break;
+  }
+  return results;
 }
 
 // ============================================================================
@@ -421,17 +411,18 @@ export async function* streamCascadeChat(
 
   try { streamReq.destroy(); } catch {}
 
-  // Extract text from the LAST few frames only.
-  // The Cascade stream structure: config frames → user echo → tool calls → response.
-  // The actual assistant response is always in the last frames before the stream settles.
-  // Early frames contain system prompts, tool definitions, and config — skip them all.
+  // Extract the response text from the last few frames using f15 field extraction.
+  // The assistant's text is always in protobuf field 15 at deep nesting.
+  // We only look at the last 5 frames to avoid config/system prompt noise.
   const lastN = Math.min(5, frameQueue.length);
   let bestResponse = '';
 
   for (let i = frameQueue.length - lastN; i < frameQueue.length; i++) {
-    const text = extractLongestNaturalText(frameQueue[i]);
-    if (text.length > bestResponse.length) {
-      bestResponse = text;
+    const f15s = extractF15Strings(frameQueue[i]);
+    for (const s of f15s) {
+      if (s.length > bestResponse.length) {
+        bestResponse = s;
+      }
     }
   }
 
