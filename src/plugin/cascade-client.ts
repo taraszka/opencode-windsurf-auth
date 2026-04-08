@@ -284,12 +284,11 @@ export async function* streamCascadeChat(
   const cascadeId = crypto.randomUUID();
   const modelUid = options.model; // Already the server model UID (e.g., "claude-opus-4-6")
 
-  // Combine messages into a single prompt
+  // Only send user messages — Cascade has its own system prompt.
+  // Sending OpenCode's system prompt would leak it into the response.
   const parts: string[] = [];
   for (const msg of options.messages) {
-    if (msg.role === 'system') {
-      parts.push(`[System]\n${msg.content}`);
-    } else if (msg.role === 'user') {
+    if (msg.role === 'user') {
       parts.push(msg.content);
     }
   }
