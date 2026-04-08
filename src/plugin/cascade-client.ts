@@ -469,13 +469,21 @@ export async function* streamCascadeChat(
     candidates.push(...f15s);
   }
 
-  // Filter out planner/brain summaries (internal Cascade thinking, not user-facing)
+  // Filter out planner summaries and system config leaked into f15
   const PLANNER_PATTERNS = [
     /main objective/i,
     /current goal is to/i,
     /I (?:need to|have to|will|should|must) (?:wait|analyze|understand|explore|look|read|check|find|search|provide|summarize)/i,
     /^(?:Initial Greeting|Repository Overview|Code Analysis|Task Analysis|User Request)/,
     /await further instructions/i,
+    // Cascade/OpenCode system prompts and config
+    /<\w+_\w+>/,  // XML-like tags: <markdown_formatting>, <tool_calling>, etc.
+    /Be terse and direct/,
+    /You are (?:Cascade|OpenCode)/,
+    /TodoWrite/,
+    /acknowledgment phrases/i,
+    /CRITICAL REQUIREMENTS/,
+    /old_string.*new_string/s,
   ];
 
   let bestResponse = '';
